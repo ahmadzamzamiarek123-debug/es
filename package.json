@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "set-webhook": "tsx scripts/set-webhook.ts",
+    "set-webhook": "tsx --env-file=.env.local scripts/set-webhook.ts",
     "format": "prettier --write ."
   },
   "dependencies": {
