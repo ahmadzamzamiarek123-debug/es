@@ -1,131 +1,33 @@
 // Bot Telegram (grammY, mode WEBHOOK — tidak ada polling/bot.start()).
 //
-// Alur: teks masuk → parse (regex→Gemini) → validasi zod → tampilkan ringkasan
-// + inline keyboard [✅ Simpan][✏️ Ubah][❌ Batal]. TIDAK ada auto-insert:
-// insert hanya terjadi setelah user menekan Simpan.
+// Alur input: teks → parse multi-op (regex→Gemini) → validasi zod → ringkasan
+// + tombol [✅ Simpan][❌ Batal]. TIDAK ada auto-insert: insert hanya setelah
+// Simpan ditekan. Batch tervalidasi disimpan di tabel pending_confirm dan
+// callback_data hanya membawa id pendek (batas Telegram 64 byte). Saat Simpan:
+// payload divalidasi ULANG (defense in depth) sebelum insert.
 //
-// State konfirmasi bersifat STATELESS agar aman di serverless: batch yang sudah
-// tervalidasi di-encode ringkas ke dalam callback_data tombol Simpan. Saat
-// ditekan, payload di-decode lalu DIVALIDASI ULANG (defense in depth) sebelum
-// insert. Jadi tidak butuh memori proses / tabel state tambahan.
+// Alur lain:
+//   - PERTANYAAN ("cek stok", "... berapa") → lib/ask.ts (baca saja).
+//   - REVISI: `undo`, `hapus <jenis> <id>`, `ubah <jenis> <id> jadi <nilai>`
+//     — selalu tampilkan data lama dulu → konfirmasi → eksekusi.
 //
 // Keamanan (verifikasi secret header + whitelist from.id) dilakukan di route
 // SEBELUM memanggil modul ini — lihat app/api/telegram/route.ts.
 
 import { Bot, InlineKeyboard, type Context } from "grammy";
-import { parseMessage } from "./parse";
-import { validateBatch, type ParsedBatch, type Entity } from "./validate";
-import { insertBatch } from "./insert";
+import { parseMessage, isQuestion } from "./parse";
+import { validateBatches, type ParsedBatch, type Entity } from "./validate";
+import {
+  insertBatches,
+  getSnapshot,
+  getLastInserted,
+  deleteRow,
+  updateMainValue,
+  ENTITY_LABEL,
+} from "./insert";
+import { savePending, takePending, discardPending } from "./pending";
+import { answerQuestion } from "./ask";
 import { formatRupiah } from "./format";
-
-// ===== Codec ringkas ParsedBatch <-> string (untuk callback_data) =====
-// Telegram membatasi callback_data 1–64 byte. JSON terlalu boros, jadi kita
-// pakai format terpisah pipa. Bila hasil > 64 byte, batch dianggap terlalu
-// besar untuk satu konfirmasi (minta user pisah). Tanggal disimpan tanpa strip
-// ("20260714") agar hemat.
-
-const ENTITY_CODE: Record<Entity, string> = {
-  production: "p",
-  stock_movement: "m",
-  sale: "s",
-  cash_in: "i",
-  cash_out: "o",
-};
-const CODE_ENTITY: Record<string, Entity> = {
-  p: "production",
-  m: "stock_movement",
-  s: "sale",
-  i: "cash_in",
-  o: "cash_out",
-};
-
-const packDate = (d: string) => d.replace(/-/g, "");
-const unpackDate = (d: string) =>
-  `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
-
-/**
- * Encode batch tervalidasi ke string ringkas. Note SENGAJA tidak diikutkan di
- * callback_data (bisa panjang & tak kritikal); note default akan diterapkan
- * ulang saat decode berdasarkan aturan domain. Mengembalikan null bila hasil
- * melebihi 64 byte.
- */
-export function encodeBatch(batch: ParsedBatch): string | null {
-  const code = ENTITY_CODE[batch.entity];
-  const rows = batch.rows.map((r) => {
-    switch (batch.entity) {
-      case "production":
-        return `${packDate((r as any).prod_date)}~${(r as any).recipes}`;
-      case "stock_movement":
-        return `${packDate((r as any).move_date)}~${(r as any).from_loc}~${(r as any).to_loc}~${(r as any).qty}`;
-      case "sale":
-        return `${packDate((r as any).sale_date)}~${(r as any).canteen}~${(r as any).qty}~${(r as any).price_rp}`;
-      case "cash_in":
-        return `${packDate((r as any).received_date)}~${(r as any).canteen}~${(r as any).amount_rp}~${(r as any).method}`;
-      case "cash_out":
-        return `${packDate((r as any).out_date)}~${(r as any).kind}~${(r as any).category}~${(r as any).amount_rp}`;
-    }
-  });
-  const payload = `s|${code}|${rows.join(";")}`;
-  // Ukur dalam byte (callback_data dibatasi byte, bukan char).
-  if (Buffer.byteLength(payload, "utf8") > 64) return null;
-  return payload;
-}
-
-/**
- * Decode kembali menjadi bentuk longgar { entity, rows } untuk divalidasi ulang.
- * Melempar bila format tak dikenali.
- */
-export function decodeBatch(data: string): {
-  entity: Entity;
-  rows: Record<string, unknown>[];
-} {
-  const parts = data.split("|");
-  if (parts[0] !== "s") throw new Error("payload bukan aksi simpan");
-  const code = parts[1] ?? "";
-  const entity = CODE_ENTITY[code];
-  if (!entity) throw new Error("entity tak dikenali");
-  const rowStrs = parts[2] ? parts[2].split(";") : [];
-  const rows = rowStrs.map((rs) => {
-    // f[i] bisa undefined (noUncheckedIndexedAccess) — beri default aman.
-    // Semua nilai di sini divalidasi ulang oleh zod, jadi nilai janggal
-    // (mis. NaN) tetap akan ditolak sebelum insert.
-    const f = rs.split("~");
-    const g = (i: number): string => f[i] ?? "";
-    switch (entity) {
-      case "production":
-        return { prod_date: unpackDate(g(0)), recipes: Number(g(1)) };
-      case "stock_movement":
-        return {
-          move_date: unpackDate(g(0)),
-          from_loc: g(1),
-          to_loc: g(2),
-          qty: Number(g(3)),
-        };
-      case "sale":
-        return {
-          sale_date: unpackDate(g(0)),
-          canteen: g(1),
-          qty: Number(g(2)),
-          price_rp: Number(g(3)),
-        };
-      case "cash_in":
-        return {
-          received_date: unpackDate(g(0)),
-          canteen: g(1),
-          amount_rp: Number(g(2)),
-          method: g(3),
-        };
-      case "cash_out":
-        return {
-          out_date: unpackDate(g(0)),
-          kind: g(1),
-          category: g(2),
-          amount_rp: Number(g(3)),
-        };
-    }
-  });
-  return { entity, rows: rows as Record<string, unknown>[] };
-}
 
 // ===== Ringkasan manusiawi untuk konfirmasi =====
 const LOC_LABEL: Record<string, string> = {
@@ -137,40 +39,101 @@ const LOC_LABEL: Record<string, string> = {
   smk: "SMK",
 };
 
-function summarize(batch: ParsedBatch): string {
-  const lines = batch.rows.map((r) => {
+const WORKER_LABEL: Record<string, string> = {
+  berdua: "Zummy & Aril",
+  zummy: "Zummy",
+  aril: "Aril",
+};
+
+function summarizeBatch(batch: ParsedBatch): string[] {
+  return batch.rows.map((r) => {
     switch (batch.entity) {
       case "production": {
-        const x = r as any;
-        return `• Produksi ${x.recipes} resep (${x.recipes * 40} biji, upah ${formatRupiah(x.recipes * 6000)}) · ${x.prod_date}`;
+        const x = r as { recipes: number; worker: string; prod_date: string };
+        const wage = x.worker === "berdua" ? x.recipes * 6000 : x.recipes * 3000;
+        return `🧊 Produksi ${x.recipes} resep (${x.recipes * 40} biji) oleh ${WORKER_LABEL[x.worker] ?? x.worker}, upah ${formatRupiah(wage)} · ${x.prod_date}`;
       }
       case "stock_movement": {
-        const x = r as any;
-        return `• Mutasi ${LOC_LABEL[x.from_loc]} → ${LOC_LABEL[x.to_loc]}: ${x.qty} biji · ${x.move_date} (tidak menambah penjualan)`;
+        const x = r as { from_loc: string; to_loc: string; qty: number; move_date: string };
+        return `🔁 Mutasi ${LOC_LABEL[x.from_loc]} → ${LOC_LABEL[x.to_loc]}: ${x.qty} biji · ${x.move_date}`;
       }
       case "sale": {
-        const x = r as any;
-        return `• Jual ${LOC_LABEL[x.canteen]}: ${x.qty} × ${formatRupiah(x.price_rp)} = ${formatRupiah(x.qty * x.price_rp)} · ${x.sale_date}`;
+        const x = r as { canteen: string; qty: number; price_rp: number; sale_date: string };
+        return `💵 Jual ${LOC_LABEL[x.canteen]}: ${x.qty} × ${formatRupiah(x.price_rp)} = ${formatRupiah(x.qty * x.price_rp)} · ${x.sale_date}`;
       }
       case "cash_in": {
-        const x = r as any;
-        return `• Kas masuk ${LOC_LABEL[x.canteen]}: ${formatRupiah(x.amount_rp)} (${x.method}) · ${x.received_date}`;
+        const x = r as { canteen: string; amount_rp: number; method: string; received_date: string };
+        return `💰 Kas masuk ${LOC_LABEL[x.canteen]}: ${formatRupiah(x.amount_rp)} (${x.method}) · ${x.received_date}`;
       }
       case "cash_out": {
-        const x = r as any;
+        const x = r as { kind: string; category: string; amount_rp: number; out_date: string };
         const jenis = x.kind === "pengambilan" ? "Pengambilan" : "Pengeluaran";
-        return `• ${jenis} [${x.category}]: ${formatRupiah(x.amount_rp)} · ${x.out_date}`;
+        return `🧾 ${jenis} [${x.category}]: ${formatRupiah(x.amount_rp)} · ${x.out_date}`;
       }
     }
   });
-  const header: Record<Entity, string> = {
-    production: "🧊 Produksi",
-    stock_movement: "🔁 Mutasi stok",
-    sale: "💵 Penjualan",
-    cash_in: "💰 Kas masuk",
-    cash_out: "🧾 Kas keluar",
-  };
-  return `${header[batch.entity]} — konfirmasi:\n${lines.join("\n")}\n\nSimpan?`;
+}
+
+function summarizeAll(batches: ParsedBatch[]): string {
+  const lines = batches.flatMap(summarizeBatch);
+  const head =
+    lines.length === 1 ? "Konfirmasi:" : `Konfirmasi ${lines.length} operasi:`;
+  return `${head}\n${lines.map((l) => `• ${l}`).join("\n")}\n\nSimpan?`;
+}
+
+// ===== Perintah revisi =====
+
+// Sinonim jenis → entity (untuk `hapus jual 12`, `ubah produksi 3 jadi 5`).
+const ENTITY_ALIAS: Record<string, Entity> = {
+  produksi: "production",
+  mutasi: "stock_movement",
+  kirim: "stock_movement",
+  jual: "sale",
+  penjualan: "sale",
+  "kas masuk": "cash_in",
+  uang: "cash_in",
+  pengeluaran: "cash_out",
+  pengambilan: "cash_out",
+  "kas keluar": "cash_out",
+};
+
+function findEntityAlias(text: string): Entity | null {
+  for (const [alias, entity] of Object.entries(ENTITY_ALIAS)) {
+    if (text.includes(alias)) return entity;
+  }
+  return null;
+}
+
+/** `hapus jual 12` / `hapus id 12` (tanpa jenis → cari di semua tabel). */
+function parseDeleteCommand(text: string): { entity: Entity | null; id: number } | null {
+  const m = text.match(/^hapus\s+(?:id\s+)?(.*?)\s*(\d+)\s*$/);
+  if (!m || !m[2]) return null;
+  const id = parseInt(m[2], 10);
+  const entity = m[1] ? findEntityAlias(m[1].trim()) : null;
+  return { entity, id };
+}
+
+/** `ubah jual 12 jadi 80` → ganti nilai utama (qty/resep/nominal). */
+function parseUpdateCommand(
+  text: string,
+): { entity: Entity | null; id: number; value: number } | null {
+  const m = text.match(/^ubah\s+(?:id\s+)?(.*?)\s*(\d+)\s+jadi\s+([\d.,]+\s*(?:rb|ribu|k|jt|juta)?)\s*$/);
+  if (!m || !m[2] || !m[3]) return null;
+  const id = parseInt(m[2], 10);
+  const entity = m[1] ? findEntityAlias(m[1].trim()) : null;
+  // nilai bisa "80" (qty) atau "20rb" (nominal)
+  const raw = m[3].trim();
+  let value: number | null = null;
+  if (/^\d+$/.test(raw)) value = parseInt(raw, 10);
+  else {
+    // impor ringan tanpa siklus: parse bentuk rb/jt di sini
+    const rb = raw.match(/^([\d.,]+)\s*(rb|ribu|k)$/);
+    const jt = raw.match(/^([\d.,]+)\s*(jt|juta)$/);
+    if (rb && rb[1]) value = Math.round(parseFloat(rb[1].replace(",", ".")) * 1000);
+    else if (jt && jt[1]) value = Math.round(parseFloat(jt[1].replace(",", ".")) * 1_000_000);
+  }
+  if (value === null || Number.isNaN(value)) return null;
+  return { entity, id, value };
 }
 
 // ===== Bot & handler =====
@@ -188,45 +151,133 @@ export function getBot(): Bot {
 
   bot.command("start", (ctx) =>
     ctx.reply(
-      "Halo! Aku bot pencatat Es Lilin 🧊\n\n" +
-        "Kirim catatan pakai bahasa bebas, contoh:\n" +
-        "• produksi 6 resep\n" +
-        "• kirim rumah->mts1 100\n" +
-        "• lempar mts2->sma 15\n" +
-        "• jual mts1 100\n" +
-        "• jual sma batch 50\n" +
-        "• uang mts1 90rb\n" +
+      "Halo Zummy! Aku bot pencatat Es Lilin 🧊\n\n" +
+        "Catat (boleh beberapa sekaligus, pisahkan dengan koma):\n" +
+        "• produksi 6 resep sendiri\n" +
+        "• mts1 kirim 100, sma kirim 50\n" +
+        "• jual mts1 100, uang mts1 90rb\n" +
         "• beli bahan 20rb\n" +
         "• ambil ayah 31500 spp\n\n" +
-        "Aku akan minta konfirmasi sebelum menyimpan. /help untuk bantuan.",
+        "Tanya:\n" +
+        "• cek stok · ringkasan hari ini\n" +
+        "• kemarin mts1 kirim berapa · transaksi terakhir\n\n" +
+        "Ralat:\n" +
+        "• undo · hapus jual 12 · ubah jual 12 jadi 80\n\n" +
+        "Aku selalu minta konfirmasi sebelum menyimpan/menghapus. /help untuk detail.",
     ),
   );
 
   bot.command("help", (ctx) =>
     ctx.reply(
-      "Format yang dikenali:\n" +
-        "Produksi: `produksi N resep`\n" +
-        "Mutasi: `kirim ASAL->TUJUAN qty` (bukan penjualan)\n" +
-        "Penjualan: `jual KANTIN qty` atau `jual sma 50 @800`\n" +
-        "  (SMA/SMK pakai batch 50 → qty kelipatan 50)\n" +
-        "Kas masuk: `uang KANTIN 90rb`\n" +
-        "Pengeluaran: `beli bahan 20rb`\n" +
-        "Pengambilan ayah: `ambil ayah 31500 spp`\n\n" +
+      "📝 INPUT (boleh multi, pisah koma / baris / 'terus'):\n" +
+        "`produksi N resep [sendiri|sama aril]`\n" +
+        "`KANTIN kirim QTY` / `kirim QTY ke KANTIN` / `kirim ASAL->TUJUAN QTY`\n" +
+        "`jual KANTIN QTY [@harga]` (SMA/SMK kelipatan 50)\n" +
+        "`uang KANTIN 90rb` · `beli bahan 20rb` · `ambil [ayah] 50rb [spp]`\n\n" +
+        "❓ TANYA:\n" +
+        "`cek stok` · `ringkasan hari ini/kemarin`\n" +
+        "`kemarin mts1 kirim berapa` · `mts1 jual berapa`\n" +
+        "`transaksi terakhir` (tampil id)\n\n" +
+        "✏️ RALAT:\n" +
+        "`undo` — batalkan input terakhir\n" +
+        "`hapus <jenis> <id>` — mis. `hapus jual 12`\n" +
+        "`ubah <jenis> <id> jadi <nilai>` — mis. `ubah mutasi 5 jadi 80`\n" +
+        "(jenis: produksi/mutasi/jual/uang/pengeluaran)\n\n" +
         "Tanggal default hari ini; bisa sebut `kemarin`.",
       { parse_mode: "Markdown" },
     ),
   );
 
-  // Pesan teks bebas → parse → validasi → konfirmasi.
+  // Pesan teks bebas → routing: revisi → pertanyaan → input.
   bot.on("message:text", async (ctx) => {
-    const text = ctx.message.text;
+    const text = ctx.message.text.trim();
     if (text.startsWith("/")) return; // command sudah ditangani di atas
+    const lower = text.toLowerCase();
 
-    let raw;
+    // ---- 1. Revisi: undo ----
+    if (lower === "undo" || lower === "batalkan terakhir") {
+      const last = await getLastInserted();
+      if (!last) {
+        await ctx.reply("Tidak ada transaksi untuk di-undo.");
+        return;
+      }
+      const kb = new InlineKeyboard()
+        .text("🗑 Ya, hapus", `d|${last.entity}|${last.id}`)
+        .text("❌ Jangan", "x|");
+      await ctx.reply(
+        `Input terakhir:\n• [${ENTITY_LABEL[last.entity]} #${last.id}] ${last.summary}\n\nHapus?`,
+        { reply_markup: kb },
+      );
+      return;
+    }
+
+    // ---- 2. Revisi: hapus <jenis> <id> ----
+    if (lower.startsWith("hapus")) {
+      const cmd = parseDeleteCommand(lower);
+      if (!cmd) {
+        await ctx.reply("Format: `hapus <jenis> <id>` — mis. `hapus jual 12`", { parse_mode: "Markdown" });
+        return;
+      }
+      const snap = cmd.entity ? await getSnapshot(cmd.entity, cmd.id) : null;
+      if (!snap) {
+        await ctx.reply(
+          cmd.entity
+            ? `Tidak ketemu ${ENTITY_LABEL[cmd.entity]} dengan id ${cmd.id}.`
+            : "Sebutkan jenisnya: `hapus jual 12` / `hapus mutasi 5` (lihat id di `transaksi terakhir`).",
+          { parse_mode: "Markdown" },
+        );
+        return;
+      }
+      const kb = new InlineKeyboard()
+        .text("🗑 Ya, hapus", `d|${snap.entity}|${snap.id}`)
+        .text("❌ Jangan", "x|");
+      await ctx.reply(`Akan dihapus:\n• [${ENTITY_LABEL[snap.entity]} #${snap.id}] ${snap.summary}\n\nYakin?`, {
+        reply_markup: kb,
+      });
+      return;
+    }
+
+    // ---- 3. Revisi: ubah <jenis> <id> jadi <nilai> ----
+    if (lower.startsWith("ubah")) {
+      const cmd = parseUpdateCommand(lower);
+      if (!cmd || !cmd.entity) {
+        await ctx.reply(
+          "Format: `ubah <jenis> <id> jadi <nilai>` — mis. `ubah mutasi 5 jadi 80`\n(nilai = qty/resep/nominal; untuk ganti tanggal/kantin: hapus lalu input ulang)",
+          { parse_mode: "Markdown" },
+        );
+        return;
+      }
+      const snap = await getSnapshot(cmd.entity, cmd.id);
+      if (!snap) {
+        await ctx.reply(`Tidak ketemu ${ENTITY_LABEL[cmd.entity]} dengan id ${cmd.id}.`);
+        return;
+      }
+      const kb = new InlineKeyboard()
+        .text("✏️ Ya, ubah", `u|${cmd.entity}|${cmd.id}|${cmd.value}`)
+        .text("❌ Jangan", "x|");
+      await ctx.reply(
+        `Data sekarang:\n• [${ENTITY_LABEL[snap.entity]} #${snap.id}] ${snap.summary}\n\nNilai utama diganti jadi ${cmd.value}. Lanjut?`,
+        { reply_markup: kb },
+      );
+      return;
+    }
+
+    // ---- 4. Pertanyaan (jalur baca) ----
+    if (isQuestion(lower)) {
+      try {
+        const answer = await answerQuestion(lower);
+        await ctx.reply(answer, { parse_mode: "Markdown" });
+      } catch {
+        await ctx.reply("Maaf, gagal mengambil laporan. Coba lagi sebentar.");
+      }
+      return;
+    }
+
+    // ---- 5. Input transaksi (multi-op) ----
+    let rawBatches;
     try {
-      raw = await parseMessage(text);
+      rawBatches = await parseMessage(text);
     } catch {
-      // Jangan bocorkan error mentah; minta ulang dengan ramah.
       await ctx.reply(
         "Maaf, aku belum paham catatan itu 🙏\nCoba tulis lebih spesifik, mis. `jual mts1 100` atau `beli bahan 20rb`. Ketik /help untuk contoh.",
         { parse_mode: "Markdown" },
@@ -234,7 +285,7 @@ export function getBot(): Bot {
       return;
     }
 
-    const result = validateBatch(raw);
+    const result = validateBatches(rawBatches);
     if (!result.ok) {
       await ctx.reply(
         "Datanya belum bisa disimpan:\n" +
@@ -244,55 +295,102 @@ export function getBot(): Bot {
       return;
     }
 
-    const encoded = encodeBatch(result.batch);
-    if (!encoded) {
-      await ctx.reply(
-        "Catatannya terlalu banyak untuk sekali konfirmasi. Coba pisah jadi beberapa pesan ya.",
-      );
+    let pendingId: string;
+    try {
+      pendingId = await savePending(result.batches);
+    } catch {
+      await ctx.reply("⚠️ Gagal menyiapkan konfirmasi. Coba lagi sebentar.");
       return;
     }
 
     const kb = new InlineKeyboard()
-      .text("✅ Simpan", encoded)
-      .text("❌ Batal", "x")
-      .row()
-      .text("✏️ Ubah (kirim ulang)", "x");
+      .text("✅ Simpan", `s|${pendingId}`)
+      .text("❌ Batal", `x|${pendingId}`);
 
-    await ctx.reply(summarize(result.batch), { reply_markup: kb });
+    await ctx.reply(summarizeAll(result.batches), { reply_markup: kb });
   });
 
-  // Tombol konfirmasi.
+  // Tombol konfirmasi: s|<pendingId>, x|<pendingId?>, d|<entity>|<id>, u|<entity>|<id>|<val>
   bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
+    const parts = data.split("|");
+    const action = parts[0] ?? "";
 
-    if (data === "x") {
-      await ctx.answerCallbackQuery({ text: "Dibatalkan" });
-      await ctx.editMessageText("❌ Dibatalkan. Tidak ada yang disimpan.");
-      return;
-    }
-
-    // Aksi simpan: decode → VALIDASI ULANG → insert.
     try {
-      const decoded = decodeBatch(data);
-      const result = validateBatch(decoded);
-      if (!result.ok) {
-        await ctx.answerCallbackQuery({ text: "Data tidak valid" });
+      // ---- Batal ----
+      if (action === "x") {
+        const pid = parts[1];
+        if (pid) await discardPending(pid).catch(() => {});
+        await ctx.answerCallbackQuery({ text: "Dibatalkan" });
+        await ctx.editMessageText("❌ Dibatalkan. Tidak ada yang berubah.");
+        return;
+      }
+
+      // ---- Simpan batch dari pending ----
+      if (action === "s") {
+        const pid = parts[1] ?? "";
+        const pending = await takePending(pid);
+        if (!pending.ok) {
+          await ctx.answerCallbackQuery({ text: "Kedaluwarsa" });
+          await ctx.editMessageText(
+            pending.reason === "notfound"
+              ? "⚠️ Konfirmasi kedaluwarsa / sudah dipakai. Kirim ulang catatannya ya."
+              : "⚠️ Data konfirmasi tidak valid. Kirim ulang catatannya ya.",
+          );
+          return;
+        }
+        const res = await insertBatches(pending.batches);
+        const lines = res.results.map((r) =>
+          "error" in r
+            ? `⚠️ ${ENTITY_LABEL[r.entity]}: gagal`
+            : `✅ ${ENTITY_LABEL[r.entity]} tersimpan — id: ${r.ids.join(", ")}`,
+        );
+        await ctx.answerCallbackQuery({
+          text: res.okCount === res.total ? "Tersimpan ✅" : "Sebagian gagal",
+        });
         await ctx.editMessageText(
-          "⚠️ Gagal menyimpan (validasi ulang tidak lolos). Coba kirim lagi.",
+          `${res.okCount}/${res.total} operasi tersimpan:\n${lines.join("\n")}`,
         );
         return;
       }
-      const inserted = await insertBatch(result.batch);
-      await ctx.answerCallbackQuery({ text: "Tersimpan ✅" });
-      await ctx.editMessageText(
-        `✅ Tersimpan (${inserted.entity}) — id: ${inserted.ids.join(", ")}`,
-      );
+
+      // ---- Hapus (undo / hapus id) ----
+      if (action === "d") {
+        const entity = parts[1] as Entity;
+        const id = parseInt(parts[2] ?? "", 10);
+        if (!entity || Number.isNaN(id)) throw new Error("payload salah");
+        const ok = await deleteRow(entity, id);
+        await ctx.answerCallbackQuery({ text: ok ? "Terhapus" : "Tidak ketemu" });
+        await ctx.editMessageText(
+          ok
+            ? `🗑 [${ENTITY_LABEL[entity]} #${id}] dihapus.`
+            : `⚠️ [${ENTITY_LABEL[entity]} #${id}] tidak ditemukan (mungkin sudah terhapus).`,
+        );
+        return;
+      }
+
+      // ---- Ubah nilai utama ----
+      if (action === "u") {
+        const entity = parts[1] as Entity;
+        const id = parseInt(parts[2] ?? "", 10);
+        const value = parseInt(parts[3] ?? "", 10);
+        if (!entity || Number.isNaN(id) || Number.isNaN(value)) throw new Error("payload salah");
+        const ok = await updateMainValue(entity, id, value);
+        const snap = ok ? await getSnapshot(entity, id) : null;
+        await ctx.answerCallbackQuery({ text: ok ? "Diubah ✅" : "Tidak ketemu" });
+        await ctx.editMessageText(
+          ok
+            ? `✏️ [${ENTITY_LABEL[entity]} #${id}] diubah.\nSekarang: ${snap?.summary ?? "(terubah)"}`
+            : `⚠️ [${ENTITY_LABEL[entity]} #${id}] tidak ditemukan.`,
+        );
+        return;
+      }
+
+      await ctx.answerCallbackQuery({ text: "Aksi tidak dikenal" });
     } catch {
-      await ctx.answerCallbackQuery({ text: "Gagal menyimpan" });
+      await ctx.answerCallbackQuery({ text: "Gagal" });
       // Pesan ramah; jangan tampilkan error mentah DB.
-      await ctx.editMessageText(
-        "⚠️ Terjadi masalah saat menyimpan. Coba lagi sebentar.",
-      );
+      await ctx.editMessageText("⚠️ Terjadi masalah. Coba lagi sebentar.").catch(() => {});
     }
   });
 

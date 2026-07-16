@@ -172,7 +172,7 @@ export default async function TransaksiPage({
                     )}
                   </b>
                   <span>
-                    {t.detail} · {t.date}
+                    <code className="txid">#{t.id}</code> · {t.detail} · {t.date}
                   </span>
                 </div>
                 <div className="tv" style={{ color }}>

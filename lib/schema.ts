@@ -15,6 +15,7 @@ import {
   date,
   index,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   smallint,
@@ -22,7 +23,7 @@ import {
   timestamp,
 } from 'drizzle-orm/pg-core';
 
-// ===== ENUM (harus identik dengan 0001_init.sql) =====
+// ===== ENUM (harus identik dengan 0001_init.sql + 0003) =====
 export const locationEnum = pgEnum('location', [
   'rumah',
   'mts1',
@@ -44,6 +45,8 @@ export const expenseCategoryEnum = pgEnum('expense_category', [
   'spp_ayah',
   'lainnya',
 ]);
+// Siapa yang mengerjakan produksi (upah Rp3.000/resep per orang yang ikut).
+export const workerEnum = pgEnum('worker', ['berdua', 'zummy', 'aril']);
 
 // ===== 1. Produksi (per resep) =====
 export const production = pgTable(
@@ -52,12 +55,22 @@ export const production = pgTable(
     id: bigint('id', { mode: 'number' }).primaryKey().generatedAlwaysAsIdentity(),
     prodDate: date('prod_date').notNull(),
     recipes: smallint('recipes').notNull(),
+    // Siapa yang mengerjakan (menentukan pembagian upah).
+    worker: workerEnum('worker').notNull().default('berdua'),
     // Dihitung DB: recipes * 40. Tidak boleh di-insert manual.
     outputPieces: integer('output_pieces').generatedAlwaysAs(
       sql`recipes * 40`,
     ),
-    // Dihitung DB: recipes * 6000 (Rp6.000/resep = Rp3.000 x 2 orang).
-    wageRp: integer('wage_rp').generatedAlwaysAs(sql`recipes * 6000`),
+    // Upah per orang: Rp3.000/resep untuk tiap orang yang ikut (0003).
+    wageZummyRp: integer('wage_zummy_rp').generatedAlwaysAs(
+      sql`CASE WHEN worker IN ('berdua','zummy') THEN recipes * 3000 ELSE 0 END`,
+    ),
+    wageArilRp: integer('wage_aril_rp').generatedAlwaysAs(
+      sql`CASE WHEN worker IN ('berdua','aril') THEN recipes * 3000 ELSE 0 END`,
+    ),
+    wageRp: integer('wage_rp').generatedAlwaysAs(
+      sql`CASE WHEN worker = 'berdua' THEN recipes * 6000 ELSE recipes * 3000 END`,
+    ),
     note: text('note'),
     createdAt: timestamp('created_at', { withTimezone: true })
       .notNull()
@@ -154,6 +167,17 @@ export const cashOut = pgTable(
     index('idx_cashout_date').on(t.outDate),
   ],
 );
+
+// ===== 6. Pending confirm (state konfirmasi bot, lihat 0003) =====
+// Batch tervalidasi menunggu tombol ✅ Simpan; callback_data hanya membawa id
+// pendek (batas Telegram 64 byte). Payload divalidasi ULANG saat dipakai.
+export const pendingConfirm = pgTable('pending_confirm', {
+  id: text('id').primaryKey(),
+  payload: jsonb('payload').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
 
 // Tipe turunan (dipakai lintas modul)
 export type ProductionRow = typeof production.$inferSelect;

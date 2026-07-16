@@ -60,4 +60,16 @@ export function getSqlWeb() {
   return _sqlWeb;
 }
 
+/**
+ * SQL mentah untuk BOT (jalur tanya laporan via chat). bot_writer memang punya
+ * SELECT; tetap tagged template berparameter, tidak ada string-concat.
+ */
+let _sqlBot: ReturnType<typeof neon> | null = null;
+export function getSqlBot() {
+  if (!_sqlBot) {
+    _sqlBot = neon(requireEnv('DATABASE_URL_BOT'));
+  }
+  return _sqlBot;
+}
+
 export { schema };

@@ -1,6 +1,6 @@
 // Uji parser regex (tanpa memanggil Gemini). Memastikan kalimat rapi → JSON benar.
 import { describe, it, expect } from "vitest";
-import { parseWithRegex, parseRupiah } from "../lib/parse";
+import { parseWithRegex, parseMultiWithRegex, parseRupiah } from "../lib/parse";
 import { todayJakarta } from "../lib/dates";
 
 describe("parseRupiah", () => {
@@ -19,11 +19,21 @@ describe("parseRupiah", () => {
 describe("parseWithRegex", () => {
   const today = todayJakarta();
 
-  it("produksi", () => {
+  it("produksi (default berdua)", () => {
     expect(parseWithRegex("produksi 6 resep")).toEqual({
       entity: "production",
-      rows: [{ prod_date: today, recipes: 6 }],
+      rows: [{ prod_date: today, recipes: 6, worker: "berdua" }],
     });
+  });
+
+  it("produksi sendiri → worker zummy", () => {
+    const r = parseWithRegex("produksi 6 resep sendiri");
+    expect(r?.rows[0]).toMatchObject({ recipes: 6, worker: "zummy" });
+  });
+
+  it("produksi sama aril → worker berdua", () => {
+    const r = parseWithRegex("produksi 4 resep sama aril");
+    expect(r?.rows[0]).toMatchObject({ recipes: 4, worker: "berdua" });
   });
 
   it("mutasi kirim rumah->mts1", () => {
@@ -82,7 +92,40 @@ describe("parseWithRegex", () => {
     });
   });
 
+  it("mutasi 'mts1 kirim 100' (tujuan di depan, asal rumah)", () => {
+    const r = parseWithRegex("mts1 kirim 100");
+    expect(r?.entity).toBe("stock_movement");
+    expect(r?.rows[0]).toMatchObject({ from_loc: "rumah", to_loc: "mts1", qty: 100 });
+  });
+
+  it("mutasi 'kirim 50 ke sma' (asal rumah)", () => {
+    const r = parseWithRegex("kirim 50 ke sma");
+    expect(r?.entity).toBe("stock_movement");
+    expect(r?.rows[0]).toMatchObject({ from_loc: "rumah", to_loc: "sma", qty: 50 });
+  });
+
   it("kalimat bebas → null (nanti fallback Gemini)", () => {
     expect(parseWithRegex("tadi pagi kayaknya laku lumayan deh")).toBeNull();
+  });
+});
+
+describe("parseMultiWithRegex", () => {
+  it("beberapa operasi dipisah koma", () => {
+    const r = parseMultiWithRegex("mts1 kirim 100, sma kirim 50");
+    expect(r).not.toBeNull();
+    expect(r).toHaveLength(2);
+    expect(r?.[0]?.rows[0]).toMatchObject({ to_loc: "mts1", qty: 100 });
+    expect(r?.[1]?.rows[0]).toMatchObject({ to_loc: "sma", qty: 50 });
+  });
+
+  it("campuran jenis: jual + kas masuk", () => {
+    const r = parseMultiWithRegex("jual mts1 100, uang mts1 90rb");
+    expect(r).toHaveLength(2);
+    expect(r?.[0]?.entity).toBe("sale");
+    expect(r?.[1]?.entity).toBe("cash_in");
+  });
+
+  it("satu potongan gagal → seluruhnya null (fallback Gemini)", () => {
+    expect(parseMultiWithRegex("jual mts1 100, entah apa ini")).toBeNull();
   });
 });

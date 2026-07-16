@@ -14,7 +14,9 @@ import { getSqlWeb } from "./db";
 export interface Summary {
   omzet: number; // total penjualan
   pengeluaran: number; // cash_out kind='pengeluaran'
-  upah: number; // production.wage_rp
+  upah: number; // total upah produksi (Zummy + Aril)
+  upahZummy: number; // production.wage_zummy_rp
+  upahAril: number; // production.wage_aril_rp
   pengambilan: number; // cash_out kind='pengambilan'
   labaUsaha: number; // omzet - (pengeluaran + upah)
   kasTersisa: number; // labaUsaha - pengambilan
@@ -37,8 +39,10 @@ export async function getSummary(start: string, end: string): Promise<Summary> {
         WHERE sale_date BETWEEN ${start} AND ${end})                       AS omzet,
       (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
         WHERE kind='pengeluaran' AND out_date BETWEEN ${start} AND ${end}) AS pengeluaran,
-      (SELECT COALESCE(SUM(wage_rp),0) FROM production
-        WHERE prod_date BETWEEN ${start} AND ${end})                       AS upah,
+      (SELECT COALESCE(SUM(wage_zummy_rp),0) FROM production
+        WHERE prod_date BETWEEN ${start} AND ${end})                       AS upah_zummy,
+      (SELECT COALESCE(SUM(wage_aril_rp),0) FROM production
+        WHERE prod_date BETWEEN ${start} AND ${end})                       AS upah_aril,
       (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
         WHERE kind='pengambilan' AND out_date BETWEEN ${start} AND ${end}) AS pengambilan
   `) as Record<string, unknown>[];
@@ -46,12 +50,14 @@ export async function getSummary(start: string, end: string): Promise<Summary> {
   const r = rows[0] ?? {};
   const omzet = toInt(r.omzet);
   const pengeluaran = toInt(r.pengeluaran);
-  const upah = toInt(r.upah);
+  const upahZummy = toInt(r.upah_zummy);
+  const upahAril = toInt(r.upah_aril);
+  const upah = upahZummy + upahAril;
   const pengambilan = toInt(r.pengambilan);
   const labaUsaha = omzet - (pengeluaran + upah);
   const kasTersisa = labaUsaha - pengambilan;
 
-  return { omzet, pengeluaran, upah, pengambilan, labaUsaha, kasTersisa };
+  return { omzet, pengeluaran, upah, upahZummy, upahAril, pengambilan, labaUsaha, kasTersisa };
 }
 
 export interface DailyOmzet {
@@ -105,9 +111,9 @@ export interface ExpenseSlice {
 }
 
 /**
- * Komposisi biaya untuk donut: pengeluaran per kategori + upah produksi
- * (upah adalah biaya usaha juga, sesuai rumus laba). Pengambilan TIDAK
- * dimasukkan (itu owner draw, bukan biaya usaha).
+ * Komposisi biaya untuk donut: pengeluaran per kategori + upah per orang
+ * (Zummy & Aril terpisah — kadang produksi tidak dikerjakan berdua).
+ * Pengambilan TIDAK dimasukkan (owner draw, bukan biaya usaha).
  */
 export async function getExpenseComposition(
   start: string,
@@ -122,7 +128,9 @@ export async function getExpenseComposition(
     ORDER BY total DESC
   `) as Record<string, unknown>[];
   const wageRows = (await sql`
-    SELECT COALESCE(SUM(wage_rp),0) AS total FROM production
+    SELECT COALESCE(SUM(wage_zummy_rp),0) AS zummy,
+           COALESCE(SUM(wage_aril_rp),0)  AS aril
+    FROM production
     WHERE prod_date BETWEEN ${start} AND ${end}
   `) as Record<string, unknown>[];
 
@@ -130,8 +138,10 @@ export async function getExpenseComposition(
     category: String(r.category),
     total: toInt(r.total),
   }));
-  const upah = toInt(wageRows[0]?.total);
-  if (upah > 0) slices.push({ category: "upah", total: upah });
+  const upahZummy = toInt(wageRows[0]?.zummy);
+  const upahAril = toInt(wageRows[0]?.aril);
+  if (upahZummy > 0) slices.push({ category: "upah Zummy", total: upahZummy });
+  if (upahAril > 0) slices.push({ category: "upah Aril", total: upahAril });
   return slices.sort((a, b) => b.total - a.total);
 }
 
@@ -285,4 +295,80 @@ export async function getNeedsCheck(
     const kasMasuk = toInt(r.masuk);
     return { canteen: String(r.canteen), omzet, kasMasuk, selisih: omzet - kasMasuk };
   });
+}
+
+// ===== Halaman Stok =====
+
+export interface StockRow {
+  loc: string;
+  masuk: number; // produksi (rumah) + mutasi masuk
+  keluar: number; // mutasi keluar
+  terjual: number;
+  sisa: number;
+}
+
+export interface StockReport {
+  prodToday: { recipes: number; pieces: number };
+  prodYesterday: { recipes: number; pieces: number };
+  keluarToday: number; // total mutasi keluar dari rumah hari ini
+  stocks: StockRow[]; // rumah + kantin non-batch (SMA/SMK tidak dilacak)
+}
+
+/**
+ * Data halaman /stok. Stok fisik = masuk − keluar − terjual per lokasi,
+ * dihitung SEPANJANG WAKTU (bukan per periode). SMA & SMK batch-50 tidak
+ * disertakan (stok fisik memang tidak dilacak — lihat CLAUDE.md §3).
+ */
+export async function getStockReport(
+  today: string,
+  yesterday: string,
+): Promise<StockReport> {
+  const sql = getSqlWeb();
+  const [prodRows, moveRows, stockRows] = await Promise.all([
+    sql`
+      SELECT
+        COALESCE(SUM(recipes)       FILTER (WHERE prod_date = ${today}), 0)::int     AS r_today,
+        COALESCE(SUM(output_pieces) FILTER (WHERE prod_date = ${today}), 0)::int     AS p_today,
+        COALESCE(SUM(recipes)       FILTER (WHERE prod_date = ${yesterday}), 0)::int AS r_yest,
+        COALESCE(SUM(output_pieces) FILTER (WHERE prod_date = ${yesterday}), 0)::int AS p_yest
+      FROM production
+    ` as Promise<Record<string, unknown>[]>,
+    sql`
+      SELECT COALESCE(SUM(qty),0)::int AS keluar
+      FROM stock_movement WHERE from_loc = 'rumah' AND move_date = ${today}
+    ` as Promise<Record<string, unknown>[]>,
+    sql`
+      WITH locs AS (SELECT unnest(ARRAY['rumah','mts1','mts2','smp']::location[]) AS loc)
+      SELECT
+        l.loc::text AS loc,
+        (CASE WHEN l.loc = 'rumah'
+              THEN COALESCE((SELECT SUM(output_pieces) FROM production), 0)
+              ELSE 0 END
+         + COALESCE((SELECT SUM(qty) FROM stock_movement m WHERE m.to_loc = l.loc), 0))::int AS masuk,
+        COALESCE((SELECT SUM(qty) FROM stock_movement m WHERE m.from_loc = l.loc), 0)::int AS keluar,
+        COALESCE((SELECT SUM(qty) FROM sale s WHERE s.canteen = l.loc), 0)::int AS terjual
+      FROM locs l
+    ` as Promise<Record<string, unknown>[]>,
+  ]);
+
+  const p = prodRows[0] ?? {};
+  const stocks: StockRow[] = stockRows.map((r) => {
+    const masuk = toInt(r.masuk);
+    const keluar = toInt(r.keluar);
+    const terjual = toInt(r.terjual);
+    return {
+      loc: String(r.loc),
+      masuk,
+      keluar,
+      terjual,
+      sisa: masuk - keluar - terjual,
+    };
+  });
+
+  return {
+    prodToday: { recipes: toInt(p.r_today), pieces: toInt(p.p_today) },
+    prodYesterday: { recipes: toInt(p.r_yest), pieces: toInt(p.p_yest) },
+    keluarToday: toInt(moveRows[0]?.keluar),
+    stocks,
+  };
 }

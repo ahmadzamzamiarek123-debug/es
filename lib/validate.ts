@@ -22,11 +22,16 @@ export const EXPENSE_CATEGORIES = [
 // Kantin yang memakai model batch 50 (kulkas, stok fisik tak dihitung).
 export const BATCH50_CANTEENS = ["sma", "smk"] as const;
 
+// Siapa yang mengerjakan produksi. Upah Rp3.000/resep per orang yang ikut:
+// berdua → Zummy+Aril (6000/resep), zummy/aril → hanya dia (3000/resep).
+export const WORKERS = ["berdua", "zummy", "aril"] as const;
+
 export const locationEnum = z.enum(LOCATIONS);
 export const canteenEnum = z.enum(CANTEENS);
 export const paymentMethodEnum = z.enum(PAYMENT_METHODS);
 export const cashoutKindEnum = z.enum(CASHOUT_KINDS);
 export const expenseCategoryEnum = z.enum(EXPENSE_CATEGORIES);
+export const workerEnum = z.enum(WORKERS);
 
 // Tanggal 'YYYY-MM-DD' yang benar-benar valid (bukan sekadar pola).
 const isoDate = z
@@ -54,10 +59,11 @@ const rupiahInt = z
   .int("nominal harus bilangan bulat rupiah (tanpa desimal)");
 
 // ===== 1. Produksi =====
-// recipes 1–50 (CLAUDE.md). output_pieces & wage_rp dihitung DB, jangan dikirim.
+// recipes 1–50 (CLAUDE.md). output_pieces & upah dihitung DB, jangan dikirim.
 export const productionSchema = z.object({
   prod_date: isoDate,
   recipes: z.number().int().min(1, "resep minimal 1").max(50, "resep maksimal 50"),
+  worker: workerEnum.default("berdua"),
   note,
 });
 
@@ -228,4 +234,37 @@ export function validateBatch(input: {
 
   // Cast aman: tiap baris sudah lolos schema entity yang sesuai.
   return { ok: true, batch: { entity, rows: validRows } as ParsedBatch };
+}
+
+export type ValidateManyResult =
+  | { ok: true; batches: ParsedBatch[] }
+  | { ok: false; errors: string[] };
+
+/**
+ * Validasi BEBERAPA batch sekaligus (hasil pesan multi-operasi).
+ * Semua-atau-tidak: satu operasi tak valid → seluruh pesan ditolak dengan
+ * pesan per operasi, supaya user tidak setengah tersimpan tanpa sadar.
+ */
+export function validateBatches(
+  inputs: { entity: unknown; rows: unknown }[],
+): ValidateManyResult {
+  if (inputs.length === 0) {
+    return { ok: false, errors: ["tidak ada operasi yang dikenali"] };
+  }
+  // Batas operasi per pesan agar konfirmasi tetap terbaca.
+  if (inputs.length > 10) {
+    return { ok: false, errors: ["terlalu banyak operasi dalam satu pesan (maks 10)"] };
+  }
+  const batches: ParsedBatch[] = [];
+  const errors: string[] = [];
+  inputs.forEach((input, i) => {
+    const res = validateBatch(input);
+    if (res.ok) {
+      batches.push(res.batch);
+    } else {
+      errors.push(...res.errors.map((e) => `operasi ${i + 1}: ${e}`));
+    }
+  });
+  if (errors.length) return { ok: false, errors };
+  return { ok: true, batches };
 }

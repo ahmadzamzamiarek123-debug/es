@@ -57,13 +57,15 @@ export default async function LaporanPage({
   const next = shiftMonth(month, 1);
   const thisMonth = currentMonthJakarta();
 
-  // Baris laporan sesuai rumus PROJECT.md §2.
+  // Baris laporan sesuai rumus PROJECT.md §2. Upah dipisah per orang
+  // (Zummy & Aril) karena produksi kadang tidak dikerjakan berdua.
   const rows: { label: string; value: number; kind: "in" | "out" | "sum" | "draw" }[] = [
     { label: "Omzet (total penjualan)", value: s.omzet, kind: "in" },
     { label: "Pengeluaran usaha", value: -s.pengeluaran, kind: "out" },
-    { label: "Upah produksi", value: -s.upah, kind: "out" },
+    { label: "Upah Zummy", value: -s.upahZummy, kind: "out" },
+    { label: "Upah Aril", value: -s.upahAril, kind: "out" },
     { label: "Laba usaha", value: s.labaUsaha, kind: "sum" },
-    { label: "Pengambilan (owner draw / SPP)", value: -s.pengambilan, kind: "draw" },
+    { label: "Pengambilan (owner draw)", value: -s.pengambilan, kind: "draw" },
     { label: "Kas tersisa", value: s.kasTersisa, kind: "sum" },
   ];
 
@@ -130,7 +132,7 @@ export default async function LaporanPage({
           <p>
             Laba usaha bisa <b>positif</b> tapi kas terasa habis karena{" "}
             <b>pengambilan</b> ({rp(s.pengambilan)}) menyedot laba. Itu bukan
-            kerugian — uang MTS2 masuk tabungan SPP lewat Ayah.
+            kerugian usaha — hanya uang yang diambil dari kas.
           </p>
         </div>
 

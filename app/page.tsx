@@ -19,7 +19,7 @@ import {
 } from "@/lib/reports";
 import { rp, rpk } from "@/lib/format";
 import { OmzetArea, KantinBars, ExpenseDonut } from "@/components/charts";
-import { BottomNav } from "@/components/nav";
+import { BottomNav, IceLogout } from "@/components/nav";
 
 export const dynamic = "force-dynamic";
 
@@ -79,9 +79,9 @@ export default async function DashboardPage({
         <div className="hi-row">
           <div>
             <p className="hi-hello">Halo,</p>
-            <p className="hi-name">Zamzami 👋</p>
+            <p className="hi-name">Zummy 👋</p>
           </div>
-          <div className="ava">🧊</div>
+          <IceLogout />
         </div>
         <p className="kas-label">Kas tersisa · {PERIOD_LABEL[period]}</p>
         <p className="kas-val">{rp(summary.kasTersisa)}</p>
@@ -196,6 +196,7 @@ export default async function DashboardPage({
                 <div className="tm">
                   <b>
                     {t.title}
+                    <span className="tag tid">#{t.id}</span>
                     {t.kind === "stock_movement" && (
                       <span className="tag mut">mutasi</span>
                     )}

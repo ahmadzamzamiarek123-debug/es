@@ -53,12 +53,13 @@
 
 ## 3. Aturan domain (logika bisnis yang gampang salah)
 
-- **1 resep = 40 biji; upah Rp6.000/resep** (Rp3.000 × 2 orang). Jangan diubah kecuali diminta.
+- **1 resep = 40 biji; upah Rp3.000/resep PER ORANG.** Produksi mencatat `worker` (`berdua`|`zummy`|`aril`): berdua → Rp6.000/resep, sendiri → Rp3.000/resep. Upah Zummy & Aril dihitung DB terpisah (`wage_zummy_rp`, `wage_aril_rp`). Jangan diubah kecuali diminta.
 - **Harga tidak di-hardcode** selain default per kantin (SMA=800, lainnya=900). Simpan `price_rp` per baris penjualan.
 - **Mutasi ≠ penjualan.** Perpindahan es (termasuk "lempar" antar kantin) masuk `stock_movement`, TIDAK menambah penjualan/kas.
-- **SMA & SMK = batch 50.** Penjualan/penagihan kelipatan 50; jangan andalkan stok fisik.
+- **SMA & SMK = batch 50.** Penjualan/penagihan kelipatan 50; jangan andalkan stok fisik. Stok fisik SMA/SMK TIDAK dilacak.
 - **Penjualan dan Kas Masuk dipisah** (uang bisa beda hari). Jangan gabung jadi satu insert.
-- **Uang MTS2 diambil ayah** = catat Penjualan (normal) + `cash_out` (`kind='pengambilan'`, `category='spp_ayah'`). Jangan hilangkan salah satu.
+- **MTS2 dicatat normal** seperti kantin lain (penjualan + kas masuk biasa). **Pengambilan ayah** di-input MANUAL sebagai `cash_out` (`kind='pengambilan'`) — TIDAK lagi otomatis dari MTS2 (aturan lama sudah dihapus).
+- **Revisi (undo/hapus/ubah) hanya lewat bot.** Web tetap read-only (role `web_reader`), tidak punya jalur tulis.
 - Tanggal default = **hari ini** menurut zona **Asia/Jakarta**.
 
 ---
