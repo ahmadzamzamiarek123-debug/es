@@ -112,8 +112,9 @@ export const sale = pgTable(
     canteen: locationEnum('canteen').notNull(),
     qty: smallint('qty').notNull(),
     priceRp: smallint('price_rp').notNull(),
-    // Dihitung DB: qty * price_rp.
-    totalRp: integer('total_rp').generatedAlwaysAs(sql`qty * price_rp`),
+    // Dihitung DB: qty * price_rp. Cast ke int WAJIB — smallint*smallint tetap
+    // smallint (maks 32.767) dan meng-overflow untuk penjualan wajar.
+    totalRp: integer('total_rp').generatedAlwaysAs(sql`qty::int * price_rp::int`),
     note: text('note'),
     createdAt: timestamp('created_at', { withTimezone: true })
       .notNull()

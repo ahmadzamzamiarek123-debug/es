@@ -126,5 +126,51 @@ export function resolveRelativeDate(message: string): string | null {
   if (/\bkemarin\b/.test(s)) return daysAgoJakarta(1);
   const iso = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
   if (iso) return resolveDateWord(iso[1]);
+  // "tanggal 14" / "tgl 14" / "14 juli" → tanggal N bulan berjalan (Asia/Jakarta).
+  const named = dayInCurrentMonth(s);
+  if (named) return named;
   return null;
+}
+
+// Nama bulan Indonesia → index 1–12 (untuk "14 juli").
+const MONTH_ID: Record<string, number> = {
+  januari: 1, februari: 2, maret: 3, april: 4, mei: 5, juni: 6,
+  juli: 7, agustus: 8, september: 9, oktober: 10, november: 11, desember: 12,
+};
+
+/**
+ * Kenali "tanggal 14" / "tgl 14" / "14 juli" → 'YYYY-MM-DD'.
+ * ASUMSI: tanpa bulan disebut, pakai bulan & tahun berjalan (Asia/Jakarta).
+ * Mengembalikan null bila bukan pola tanggal atau harinya tak masuk akal.
+ */
+function dayInCurrentMonth(s: string): string | null {
+  const today = todayJakarta(); // YYYY-MM-DD
+  const curY = Number(today.slice(0, 4));
+  const curM = Number(today.slice(5, 7));
+
+  // "14 juli [2026]" — hari + nama bulan.
+  const withMonth = s.match(/\b(\d{1,2})\s+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)(?:\s+(\d{4}))?\b/);
+  if (withMonth && withMonth[1] && withMonth[2]) {
+    const d = Number(withMonth[1]);
+    const m = MONTH_ID[withMonth[2]] ?? curM;
+    const y = withMonth[3] ? Number(withMonth[3]) : curY;
+    return buildDate(y, m, d);
+  }
+
+  // "tanggal 14" / "tgl 14" / "tgl. 14" — hari saja, bulan berjalan.
+  const dayOnly = s.match(/\b(?:tanggal|tgl\.?)\s+(\d{1,2})\b/);
+  if (dayOnly && dayOnly[1]) {
+    return buildDate(curY, curM, Number(dayOnly[1]));
+  }
+  return null;
+}
+
+/** Rakit 'YYYY-MM-DD' bila hari valid untuk bulan itu, else null. */
+function buildDate(y: number, m: number, d: number): string | null {
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null; // mis. 31 Feb
+  const mm = m.toString().padStart(2, "0");
+  const dd = d.toString().padStart(2, "0");
+  return `${y}-${mm}-${dd}`;
 }

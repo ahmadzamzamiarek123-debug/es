@@ -73,7 +73,11 @@ export const stockMovementSchema = z
     move_date: isoDate,
     from_loc: locationEnum,
     to_loc: locationEnum,
-    qty: z.number().int().min(1, "qty minimal 1").max(2000, "qty tak wajar (>2000)"),
+    qty: z
+      .number({ invalid_type_error: "sebutkan jumlah biji yang dikirim (mis. kirim mts1 100)", required_error: "sebutkan jumlah biji yang dikirim (mis. kirim mts1 100)" })
+      .int()
+      .min(1, "qty minimal 1")
+      .max(2000, "qty tak wajar (>2000)"),
     note,
   })
   .refine((r) => r.from_loc !== r.to_loc, {
@@ -87,9 +91,13 @@ export const stockMovementSchema = z
 export const saleSchema = z.object({
   sale_date: isoDate,
   canteen: canteenEnum,
-  qty: z.number().int().min(0, "qty tak boleh negatif").max(2000, "qty tak wajar (>2000)"),
+  qty: z
+    .number({ invalid_type_error: "sebutkan jumlah biji yang terjual (mis. jual mts1 79)", required_error: "sebutkan jumlah biji yang terjual (mis. jual mts1 79)" })
+    .int()
+    .min(0, "qty tak boleh negatif")
+    .max(2000, "qty tak wajar (>2000)"),
   price_rp: z
-    .number()
+    .number({ invalid_type_error: "harga per biji belum jelas (mis. jual mts1 79 @900)", required_error: "harga per biji belum jelas (mis. jual mts1 79 @900)" })
     .int()
     .min(100, "harga tak wajar (<100)")
     .max(5000, "harga tak wajar (>5000)"),

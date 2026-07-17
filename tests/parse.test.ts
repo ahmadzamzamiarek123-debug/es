@@ -104,6 +104,14 @@ describe("parseWithRegex", () => {
     expect(r?.rows[0]).toMatchObject({ from_loc: "rumah", to_loc: "sma", qty: 50 });
   });
 
+  it("penjualan dengan 'tanggal N' → tanggal bulan berjalan", () => {
+    const r = parseWithRegex("tanggal 14 jual mts1 79");
+    expect(r?.entity).toBe("sale");
+    expect(r?.rows[0]).toMatchObject({ canteen: "mts1", qty: 79 });
+    // sale_date harus berakhiran -14 (hari ke-14), bukan hari ini
+    expect((r?.rows[0] as { sale_date: string }).sale_date).toMatch(/-14$/);
+  });
+
   it("kalimat bebas → null (nanti fallback Gemini)", () => {
     expect(parseWithRegex("tadi pagi kayaknya laku lumayan deh")).toBeNull();
   });

@@ -279,7 +279,13 @@ export function getBot(): Bot {
       rawBatches = await parseMessage(text);
     } catch {
       await ctx.reply(
-        "Maaf, aku belum paham catatan itu 🙏\nCoba tulis lebih spesifik, mis. `jual mts1 100` atau `beli bahan 20rb`. Ketik /help untuk contoh.",
+        "Maaf, aku belum paham catatan itu 🙏\n\n" +
+          "Coba sebutkan angkanya dengan jelas, contoh:\n" +
+          "• `jual mts1 79` (79 biji terjual)\n" +
+          "• `kirim mts1 100` · `mts1 kirim sisa 21 ke mts2`\n" +
+          "• `tanggal 14 jual mts1 79`\n" +
+          "• `uang mts1 90rb` · `beli bahan 20rb`\n\n" +
+          "Aku tidak menebak jumlah — kalau jumlah tak disebut, aku minta diperjelas. /help untuk contoh lengkap.",
         { parse_mode: "Markdown" },
       );
       return;

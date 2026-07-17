@@ -341,11 +341,16 @@ Kolom per entity:
 - cash_out: out_date, kind(pengeluaran|pengambilan), category(bahan|gas_listrik|plastik|transport|spp_ayah|lainnya), amount_rp(int), note?
 Lokasi valid: rumah, mts1, mts2, smp, sma, smk. canteen tidak boleh 'rumah'.
 "X kirim 100" atau "kirim 100 ke X" = stock_movement dari rumah ke X.
+"sisa N dilempar/dipindah ke Y" (dalam konteks lokasi X) = stock_movement dari X ke Y sebanyak N.
 Harga default per biji: sma=800, lainnya=900 (pakai bila tak disebut).
 SMA & SMK memakai batch 50: qty penjualan kelipatan 50.
 "ambil ayah"/"pengambilan" = cash_out kind=pengambilan (category spp_ayah bila terkait ayah/SPP).
+Tanggal: "tanggal 14"/"tgl 14"/"14 juli" → pakai bulan & tahun berjalan bila tak lengkap.
 Uang berupa integer rupiah tanpa desimal (20rb=20000, 1,5jt=1500000).
-Jika informasi kurang untuk mengisi kolom wajib, JANGAN mengarang nominal — lewati operasi itu. Jawab HANYA JSON, tanpa penjelasan.`;
+ATURAN PALING PENTING: JANGAN PERNAH mengarang atau menebak angka (qty/harga/nominal).
+Jika jumlah tidak disebut eksplisit (mis. "sudah terjual" tanpa angka), JANGAN buat operasi
+penjualan/kas untuk itu — LEWATI. Lebih baik menghasilkan sedikit operasi yang pasti daripada menebak.
+Jawab HANYA JSON, tanpa penjelasan.`;
 
 /**
  * Fallback ke Gemini: seluruh pesan → daftar operasi.
