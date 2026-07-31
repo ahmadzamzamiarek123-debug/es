@@ -48,6 +48,7 @@ export async function GET(req: Request) {
     ["Upah Aril", s.upahAril],
     ["Upah produksi (total)", s.upah],
     ["Laba usaha", s.labaUsaha],
+    ["Saldo awal (modal)", s.saldoAwal],
     ["Pengambilan", s.pengambilan],
     ["Kas tersisa", s.kasTersisa],
   ];

@@ -12,7 +12,7 @@
  * Nilai uang di sini SUDAH integer rupiah (dijamin oleh zod .int()). Tidak ada
  * float yang menyentuh DB.
  */
-import { desc, eq } from 'drizzle-orm';
+import { desc, eq, sql } from 'drizzle-orm';
 import { getDbBot } from './db';
 import {
   production,
@@ -20,8 +20,16 @@ import {
   sale,
   cashIn,
   cashOut,
+  locationRef,
+  openingBalance,
 } from './schema';
-import type { Entity, ParsedBatch } from './validate';
+import type {
+  Entity,
+  ParsedBatch,
+  LocationSetting,
+  OpeningBalanceInput,
+} from './validate';
+import { invalidateLocations } from './locations';
 
 /** Hasil insert: entity + daftar id baris yang tersimpan (untuk balasan bot). */
 export interface InsertResult {
@@ -301,4 +309,72 @@ export async function updateMainValue(
       return r.length > 0;
     }
   }
+}
+
+// ===== /setting — kelola lokasi & saldo awal (hanya lewat bot) =====
+
+/**
+ * Tambah / ubah satu lokasi (upsert by code). Dipakai owner via /setting untuk
+ * mendaftarkan 7 sekolah + harga per kantin. Selalu is_canteen=true (yang
+ * ditambah owner adalah kantin; gudang 'rumah' sudah diseed migrasi 0005).
+ * Sesudah menulis → invalidasi cache lokasi agar parser/validator segar.
+ */
+export async function upsertLocation(loc: LocationSetting): Promise<void> {
+  const db = getDbBot();
+  await db
+    .insert(locationRef)
+    .values({
+      code: loc.code,
+      label: loc.label,
+      isCanteen: true,
+      isWarehouse: false,
+      isBatch50: loc.is_batch50,
+      priceRp: loc.price_rp ?? null,
+    })
+    .onConflictDoUpdate({
+      target: locationRef.code,
+      set: {
+        label: loc.label,
+        isBatch50: loc.is_batch50,
+        priceRp: loc.price_rp ?? null,
+        active: true,
+      },
+    });
+  invalidateLocations();
+}
+
+/** Nonaktifkan sebuah lokasi (soft-delete: active=false). */
+export async function deactivateLocation(code: string): Promise<boolean> {
+  const db = getDbBot();
+  const r = await db
+    .update(locationRef)
+    .set({ active: false })
+    .where(eq(locationRef.code, code))
+    .returning({ code: locationRef.code });
+  invalidateLocations();
+  return r.length > 0;
+}
+
+/**
+ * Set saldo awal (baris tunggal id=1). Upsert: sekali isi, boleh dikoreksi.
+ * Baseline modal (kas + nilai bahan awal) untuk rumus kas di laporan.
+ */
+export async function setOpeningBalance(inp: OpeningBalanceInput): Promise<void> {
+  const db = getDbBot();
+  await db
+    .insert(openingBalance)
+    .values({
+      id: 1,
+      saldoAwalRp: inp.saldo_awal_rp,
+      note: inp.note ?? null,
+      updatedAt: sql`now()`,
+    })
+    .onConflictDoUpdate({
+      target: openingBalance.id,
+      set: {
+        saldoAwalRp: inp.saldo_awal_rp,
+        note: inp.note ?? null,
+        updatedAt: sql`now()`,
+      },
+    });
 }

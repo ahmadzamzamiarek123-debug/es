@@ -19,34 +19,38 @@ Bot = jalur **tulis**. Web = jalur **baca**. Keduanya menunjuk ke database yang 
 
 ## 2. Konteks bisnis (WAJIB dipahami, ini bagian tersulit)
 
-5 lokasi kantin + rumah (gudang):
+Kantin (sekolah) **7+** + rumah (gudang). Daftar kantin **bukan lagi nilai tetap**:
+tersimpan di tabel `location_ref` dan dikelola pemilik lewat `/setting` (kode,
+nama, harga, penanda batch 50). Migrasi hanya menyeed gudang `rumah`; semua
+kantin/sekolah didaftarkan pemilik. Contoh bentuk kantin:
 
-| Lokasi | Bentuk | Harga jual ke kantin | Catatan |
-|---|---|---|---|
-| MTS1 | wadah biasa | Rp900/biji | es dibawa pulang, sisa bisa dihitung |
-| MTS2 | wadah biasa | Rp900/biji | uangnya **diambil ayah** untuk tabungan SPP |
-| SMP | wadah biasa | Rp900/biji | es dibawa pulang, sisa bisa dihitung |
-| SMA | **kulkas** | Rp800/biji | pakai model **batch 50**, stok fisik tidak dihitung |
-| SMK | **kulkas** | Rp900/biji | pakai model **batch 50**, stok fisik tidak dihitung |
+| Bentuk | Harga jual (omzet kita) | Catatan |
+|---|---|---|
+| wadah biasa | default **Rp1.300/biji** | es dibawa pulang, sisa bisa dihitung |
+| **kulkas** | default **Rp1.300/biji** | pakai model **batch 50**, stok fisik tidak dihitung |
 
-Harga **tidak boleh di-hardcode** kecuali sebagai nilai default; harga per transaksi disimpan di kolom `price_rp` (karena bisa berbeda per kantin & bisa berubah).
+- **Harga jual = omzet kita** (yang disimpan di `price_rp`). Harga eceran ke
+  siswa (mis. Rp1.500) **tidak** disimpan. Harga **tidak di-hardcode** selain
+  default; harga default per kantin diatur lewat `/setting` dan disalin ke tiap
+  baris penjualan (bisa berbeda per kantin & berubah).
 
 ### Aturan domain penting
 
-1. **Produksi per resep.** Tiap malam buat 4–8 resep. 1 resep = **40 biji**. Upah = **Rp3.000/resep untuk tiap orang** (pemilik + adik) = **Rp6.000/resep total**.
-2. **Mutasi ≠ Penjualan.** Es sering dipindah antar kantin (mis. sisa MTS2 dilempar ke SMA agar tidak balik rumah). Perpindahan dicatat sebagai **mutasi stok**, BUKAN penjualan, supaya tidak dobel hitung.
-3. **Model batch 50 untuk SMA & SMK.** Karena berbentuk kulkas & stok fisik tidak dihitung, penagihan **selalu genap kelipatan 50**. Jadi "penjualan" SMA/SMK = jumlah batch yang ditagih, bukan sisa fisik.
-4. **Uang bisa beda hari.** Terutama SMA/SMK: uang diterima saat pengisian berikutnya. Maka **Penjualan** (kapan terjual) dan **Kas Masuk** (kapan uang diterima) dipisah.
-5. **Uang MTS2 diambil ayah.** Tetap dicatat **2x**: sebagai **Penjualan** (pendapatan) DAN sebagai **Pengeluaran/Pengambilan** jenis `pengambilan` kategori `spp_ayah`. Jangan dihapus — biar laporan jujur & menjelaskan kenapa kas terasa selalu habis.
+1. **Produksi per resep.** Tiap malam buat 4–8 resep. 1 resep = **40 biji**. Upah = **Rp5.000/resep untuk tiap orang** (Zummy + Aril) = **Rp10.000/resep bila berdua**. Produksi mencatat `worker` (`berdua|zummy|aril`); DB menghitung `wage_zummy_rp` & `wage_aril_rp` terpisah.
+2. **Mutasi ≠ Penjualan.** Es sering dipindah antar kantin (mis. sisa dilempar ke kantin lain agar tidak balik rumah). Perpindahan dicatat sebagai **mutasi stok**, BUKAN penjualan, supaya tidak dobel hitung.
+3. **Model batch 50 (kantin berkulkas, mis. SMA & SMK).** Karena stok fisik tidak dihitung, penagihan **selalu genap kelipatan 50**. Penanda batch 50 diatur per kantin lewat `/setting`.
+4. **Uang bisa beda hari.** Terutama kantin batch 50: uang diterima saat pengisian berikutnya. Maka **Penjualan** (kapan terjual) dan **Kas Masuk** (kapan uang diterima) dipisah.
+5. **MTS2 dicatat normal** seperti kantin lain (penjualan + kas masuk biasa). **Pengambilan ayah** (owner draw untuk SPP) diinput **manual** sebagai `cash_out` `kind='pengambilan'` `category='spp_ayah'` — tidak lagi otomatis dari MTS2.
+6. **Saldo awal (modal).** Baseline modal (kas + nilai bahan awal) sebagai titik-nol **satu kali**, diisi lewat `/setting saldo`. Bukan pelacakan stok bahan.
 
 ### Rumus laporan inti
 
 ```
 Laba usaha  = Omzet (total penjualan) − Biaya (pengeluaran + upah produksi)
-Kas tersisa = Laba usaha − Pengambilan (owner draw, mis. SPP via MTS2)
+Kas tersisa = Saldo awal + Laba usaha − Pengambilan (owner draw, mis. SPP)
 ```
 
-Insight yang harus bisa dibuktikan dashboard: laba usaha biasanya **positif**, tapi kas ~0 karena **pengambilan menyedot laba**.
+Insight yang harus bisa dibuktikan dashboard: laba usaha biasanya **positif**, tapi kas terasa habis karena **pengambilan menyedot laba**.
 
 ---
 
@@ -93,8 +97,8 @@ Insight yang harus bisa dibuktikan dashboard: laba usaha biasanya **positif**, t
 | ORM/query | **Drizzle ORM** | ringan, type-safe (SQL manual berparameter juga boleh) |
 | Validasi | **zod** | validasi output AI & input sebelum insert |
 | Bot | **grammY** (mode webhook) | ringan, dukungan webhook & inline keyboard bagus |
-| AI | **`@google/generative-ai`**, model `gemini-1.5-flash` (atau `gemini-2.0-flash`) | free tier, cepat, murah token |
-| Grafik | **Recharts** | ringan, gratis |
+| AI | **`@google/generative-ai`**, model `gemini-2.0-flash` (default; override `GEMINI_MODEL`) | free tier, cepat, murah token |
+| Grafik | **SVG/CSS server-render** (tanpa Recharts, demi bundel ringan) | gratis, First Load kecil |
 | Deploy | **Vercel** | gratis, native Next.js |
 
 **Batasan:** semua harus muat di **free tier**. Jangan tambahkan layanan berbayar atau dependency berat yang tidak perlu.
@@ -103,10 +107,26 @@ Insight yang harus bisa dibuktikan dashboard: laba usaha biasanya **positif**, t
 
 ## 5. Skema database (Neon PostgreSQL)
 
-> File migrasi harus dibuat di `db/migrations/0001_init.sql` **persis** seperti ini. User yang akan menjalankannya di Neon.
+> File migrasi `0001_init.sql` di bawah adalah bentuk **AWAL** (historis). Skema
+> berjalan sekarang sudah **berevolusi** lewat migrasi `0003`–`0008`. Perubahan
+> penting terhadap blok di bawah:
+>
+> - **Upah (0007):** `wage_rp` = `recipes * 5000` (per orang) + `worker`
+>   (`berdua|zummy|aril`) + kolom `wage_zummy_rp` & `wage_aril_rp` (berdua =
+>   `recipes*10000`). Menggantikan `recipes * 6000`.
+> - **Lokasi (0005–0006):** ENUM `location` **dihapus**, diganti tabel referensi
+>   `location_ref(code, label, is_canteen, is_warehouse, is_batch50, price_rp,
+>   active, …)`. Kolom `from_loc`/`to_loc`/`canteen` jadi `text` + **FK** ke
+>   `location_ref(code)`. Aturan "kantin bukan gudang" ditegakkan via **FK-subset**
+>   ke `location_ref(code, is_canteen)` (bukan `CHECK canteen <> 'rumah'`).
+> - **Saldo awal (0008):** tabel satu-baris `opening_balance(id=1, saldo_awal_rp,
+>   note, updated_at)` untuk baseline modal.
+> - **pending_confirm (0004):** tabel state konfirmasi bot.
+>
+> Blok di bawah dipertahankan sebagai catatan sejarah `0001`.
 
 ```sql
--- ===== ENUM =====
+-- ===== ENUM (0001; catatan: enum `location` dihapus di 0006) =====
 CREATE TYPE location AS ENUM ('rumah','mts1','mts2','smp','sma','smk');
 CREATE TYPE payment_method AS ENUM ('cash','transfer');
 CREATE TYPE cashout_kind AS ENUM ('pengeluaran','pengambilan');
@@ -213,7 +233,7 @@ GRANT SELECT
 - `/start`, `/help` — bantuan singkat & contoh format.
 - **Produksi**: `"produksi 6 resep"` → production.
 - **Mutasi/kirim**: `"kirim rumah->mts1 100"`, `"lempar mts2->sma 15"`.
-- **Penjualan**: `"jual mts1 100"` (harga default per kantin), `"jual sma 50 @800"`.
+- **Penjualan**: `"jual mts1 100"` (harga default per kantin, mis. 1300), `"jual sma 50 @1300"`.
 - **Kas masuk**: `"uang mts1 90rb"`.
 - **Pengeluaran**: `"beli bahan 20rb"`, `"ambil ayah 31500 spp"` (→ cash_out pengambilan).
 - Tanggal default = hari ini (timezone **Asia/Jakarta**); boleh sebut "kemarin".
@@ -223,11 +243,12 @@ GRANT SELECT
 {
   "entity": "sale",
   "rows": [
-    { "sale_date": "2026-07-14", "canteen": "sma", "qty": 50, "price_rp": 800, "note": "batch 50" }
+    { "sale_date": "2026-07-14", "canteen": "sma", "qty": 50, "price_rp": 1300, "note": "batch 50" }
   ]
 }
 ```
 `entity` ∈ `production | stock_movement | sale | cash_in | cash_out`. Selalu berupa array `rows`.
+`canteen`/`from_loc`/`to_loc` = kode `location_ref` (bukan lagi enum tetap); harga `price_rp` = omzet kita.
 
 ### Error handling
 - Jangan pernah kirim error mentah DB ke chat. Balas pesan ramah + minta ulang.

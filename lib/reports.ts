@@ -5,7 +5,8 @@
 //
 // Rumus (PROJECT.md §2):
 //   Laba usaha  = Omzet − (Pengeluaran + Upah produksi)
-//   Kas tersisa = Laba usaha − Pengambilan
+//   Kas tersisa = Saldo awal + Laba usaha − Pengambilan
+// Saldo awal = baseline modal (kas + nilai bahan awal), sekali isi via /setting.
 // Pengambilan (owner draw, mis. SPP via MTS2) TIDAK mengurangi laba usaha,
 // hanya mengurangi kas tersisa.
 
@@ -18,8 +19,9 @@ export interface Summary {
   upahZummy: number; // production.wage_zummy_rp
   upahAril: number; // production.wage_aril_rp
   pengambilan: number; // cash_out kind='pengambilan'
+  saldoAwal: number; // opening_balance.saldo_awal_rp (baseline modal)
   labaUsaha: number; // omzet - (pengeluaran + upah)
-  kasTersisa: number; // labaUsaha - pengambilan
+  kasTersisa: number; // saldoAwal + labaUsaha - pengambilan
 }
 
 const toInt = (v: unknown): number => {
@@ -28,8 +30,31 @@ const toInt = (v: unknown): number => {
 };
 
 /**
+ * Peta kode→label semua lokasi (dinamis dari location_ref). Dipakai halaman
+ * web untuk menampilkan nama kantin/gudang tanpa hardcode. Role web_reader:
+ * hanya SELECT. Fallback label = kode di-UPPERCASE bila belum ada di peta.
+ */
+export async function getLocationLabels(): Promise<Record<string, string>> {
+  const sql = getSqlWeb();
+  const rows = (await sql`
+    SELECT code, label FROM location_ref ORDER BY code
+  `) as Record<string, unknown>[];
+  const map: Record<string, string> = {};
+  for (const r of rows) map[String(r.code)] = String(r.label);
+  return map;
+}
+
+/** Label tampilan sebuah kode lokasi (fallback: kode di-UPPERCASE). */
+export function labelOf(code: string, labels: Record<string, string>): string {
+  return labels[code] ?? code.toUpperCase();
+}
+
+/**
  * Ringkasan angka untuk rentang tanggal [start, end] inklusif.
  * start & end berupa 'YYYY-MM-DD'.
+ *
+ * CATATAN saldo awal: baseline modal adalah nilai SATU-KALI (titik nol), jadi
+ * TIDAK difilter tanggal — selalu diikutkan penuh ke kas tersisa.
  */
 export async function getSummary(start: string, end: string): Promise<Summary> {
   const sql = getSqlWeb();
@@ -44,7 +69,8 @@ export async function getSummary(start: string, end: string): Promise<Summary> {
       (SELECT COALESCE(SUM(wage_aril_rp),0) FROM production
         WHERE prod_date BETWEEN ${start} AND ${end})                       AS upah_aril,
       (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
-        WHERE kind='pengambilan' AND out_date BETWEEN ${start} AND ${end}) AS pengambilan
+        WHERE kind='pengambilan' AND out_date BETWEEN ${start} AND ${end}) AS pengambilan,
+      (SELECT COALESCE(saldo_awal_rp,0) FROM opening_balance WHERE id=1)    AS saldo_awal
   `) as Record<string, unknown>[];
 
   const r = rows[0] ?? {};
@@ -54,10 +80,11 @@ export async function getSummary(start: string, end: string): Promise<Summary> {
   const upahAril = toInt(r.upah_aril);
   const upah = upahZummy + upahAril;
   const pengambilan = toInt(r.pengambilan);
+  const saldoAwal = toInt(r.saldo_awal);
   const labaUsaha = omzet - (pengeluaran + upah);
-  const kasTersisa = labaUsaha - pengambilan;
+  const kasTersisa = saldoAwal + labaUsaha - pengambilan;
 
-  return { omzet, pengeluaran, upah, upahZummy, upahAril, pengambilan, labaUsaha, kasTersisa };
+  return { omzet, pengeluaran, upah, upahZummy, upahAril, pengambilan, saldoAwal, labaUsaha, kasTersisa };
 }
 
 export interface DailyOmzet {
@@ -166,7 +193,7 @@ export async function getRecentTransactions(
 ): Promise<TxRow[]> {
   const sql = getSqlWeb();
   // Ambil per tabel lalu gabung di aplikasi — lebih mudah dibaca & tetap aman.
-  const [sales, movements, cashIns, cashOuts, prods] = await Promise.all([
+  const [sales, movements, cashIns, cashOuts, prods, labels] = await Promise.all([
     sql`SELECT id, sale_date::text AS d, canteen::text AS canteen, qty, total_rp
         FROM sale WHERE sale_date BETWEEN ${start} AND ${end}
         ORDER BY sale_date DESC, id DESC LIMIT ${limit}` as Promise<
@@ -192,9 +219,10 @@ export async function getRecentTransactions(
         ORDER BY prod_date DESC, id DESC LIMIT ${limit}` as Promise<
       Record<string, unknown>[]
     >,
+    getLocationLabels(),
   ]);
 
-  const up = (s: string) => s.toUpperCase();
+  const lbl = (code: string) => labelOf(code, labels);
   const tx: TxRow[] = [];
 
   for (const r of sales) {
@@ -202,7 +230,7 @@ export async function getRecentTransactions(
       id: toInt(r.id),
       kind: "sale",
       date: String(r.d),
-      title: `Jual ${up(String(r.canteen))}`,
+      title: `Jual ${lbl(String(r.canteen))}`,
       detail: `${toInt(r.qty)} biji`,
       amount: toInt(r.total_rp),
       direction: "in",
@@ -213,7 +241,7 @@ export async function getRecentTransactions(
       id: toInt(r.id),
       kind: "stock_movement",
       date: String(r.d),
-      title: `Mutasi ${up(String(r.f))} → ${up(String(r.t))}`,
+      title: `Mutasi ${lbl(String(r.f))} → ${lbl(String(r.t))}`,
       detail: `${toInt(r.qty)} biji`,
       amount: null,
       direction: "neutral",
@@ -224,7 +252,7 @@ export async function getRecentTransactions(
       id: toInt(r.id),
       kind: "cash_in",
       date: String(r.d),
-      title: `Kas masuk ${up(String(r.canteen))}`,
+      title: `Kas masuk ${lbl(String(r.canteen))}`,
       detail: String(r.method),
       amount: toInt(r.amount_rp),
       direction: "in",
@@ -276,18 +304,20 @@ export async function getNeedsCheck(
   end: string,
 ): Promise<CheckItem[]> {
   const sql = getSqlWeb();
+  // Daftar kantin diambil dari location_ref (dinamis), bukan enum hardcode.
   const rows = (await sql`
-    SELECT c.canteen::text AS canteen,
+    SELECT c.code AS canteen,
            COALESCE(s.omzet,0)   AS omzet,
            COALESCE(ci.masuk,0)  AS masuk
-    FROM (SELECT unnest(ARRAY['mts1','mts2','smp','sma','smk']::location[]) AS canteen) c
+    FROM (SELECT code FROM location_ref
+          WHERE is_canteen = true AND is_warehouse = false AND active = true) c
     LEFT JOIN (SELECT canteen, SUM(total_rp) AS omzet FROM sale
                WHERE sale_date BETWEEN ${start} AND ${end} GROUP BY canteen) s
-      ON s.canteen = c.canteen
+      ON s.canteen = c.code
     LEFT JOIN (SELECT canteen, SUM(amount_rp) AS masuk FROM cash_in
                WHERE received_date BETWEEN ${start} AND ${end} GROUP BY canteen) ci
-      ON ci.canteen = c.canteen
-    ORDER BY c.canteen
+      ON ci.canteen = c.code
+    ORDER BY c.code
   `) as Record<string, unknown>[];
 
   return rows.map((r) => {
@@ -312,6 +342,7 @@ export interface StockReport {
   prodYesterday: { recipes: number; pieces: number };
   keluarToday: number; // total mutasi keluar dari rumah hari ini
   stocks: StockRow[]; // rumah + kantin non-batch (SMA/SMK tidak dilacak)
+  batch50: string[]; // kode kantin batch-50 (stok fisik tak dilacak)
 }
 
 /**
@@ -324,7 +355,7 @@ export async function getStockReport(
   yesterday: string,
 ): Promise<StockReport> {
   const sql = getSqlWeb();
-  const [prodRows, moveRows, stockRows] = await Promise.all([
+  const [prodRows, moveRows, stockRows, batch50Rows] = await Promise.all([
     sql`
       SELECT
         COALESCE(SUM(recipes)       FILTER (WHERE prod_date = ${today}), 0)::int     AS r_today,
@@ -335,19 +366,34 @@ export async function getStockReport(
     ` as Promise<Record<string, unknown>[]>,
     sql`
       SELECT COALESCE(SUM(qty),0)::int AS keluar
-      FROM stock_movement WHERE from_loc = 'rumah' AND move_date = ${today}
+      FROM stock_movement
+      WHERE from_loc IN (SELECT code FROM location_ref WHERE is_warehouse = true)
+        AND move_date = ${today}
     ` as Promise<Record<string, unknown>[]>,
+    // Lokasi yang stok fisiknya dilacak = gudang + kantin NON-batch50 (aktif).
+    // SMA/SMK (batch50) sengaja dikecualikan (stok fisik tak dilacak).
     sql`
-      WITH locs AS (SELECT unnest(ARRAY['rumah','mts1','mts2','smp']::location[]) AS loc)
+      WITH locs AS (
+        SELECT code AS loc, is_warehouse
+        FROM location_ref
+        WHERE active = true AND is_batch50 = false
+      )
       SELECT
-        l.loc::text AS loc,
-        (CASE WHEN l.loc = 'rumah'
+        l.loc AS loc,
+        (CASE WHEN l.is_warehouse
               THEN COALESCE((SELECT SUM(output_pieces) FROM production), 0)
               ELSE 0 END
          + COALESCE((SELECT SUM(qty) FROM stock_movement m WHERE m.to_loc = l.loc), 0))::int AS masuk,
         COALESCE((SELECT SUM(qty) FROM stock_movement m WHERE m.from_loc = l.loc), 0)::int AS keluar,
         COALESCE((SELECT SUM(qty) FROM sale s WHERE s.canteen = l.loc), 0)::int AS terjual
       FROM locs l
+      ORDER BY l.is_warehouse DESC, l.loc
+    ` as Promise<Record<string, unknown>[]>,
+    // Kantin batch-50 aktif (stok fisik tak dilacak) → hanya untuk badge info.
+    sql`
+      SELECT code FROM location_ref
+      WHERE active = true AND is_batch50 = true
+      ORDER BY code
     ` as Promise<Record<string, unknown>[]>,
   ]);
 
@@ -370,5 +416,6 @@ export async function getStockReport(
     prodYesterday: { recipes: toInt(p.r_yest), pieces: toInt(p.p_yest) },
     keluarToday: toInt(moveRows[0]?.keluar),
     stocks,
+    batch50: batch50Rows.map((r) => String(r.code)),
   };
 }

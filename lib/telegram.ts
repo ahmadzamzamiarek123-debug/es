@@ -15,55 +15,91 @@
 // SEBELUM memanggil modul ini — lihat app/api/telegram/route.ts.
 
 import { Bot, InlineKeyboard, type Context } from "grammy";
-import { parseMessage, isQuestion } from "./parse";
-import { validateBatches, type ParsedBatch, type Entity } from "./validate";
+import { parseMessage, isQuestion, parseRupiah } from "./parse";
+import {
+  validateBatches,
+  locationSettingSchema,
+  openingBalanceSchema,
+  type ParsedBatch,
+  type Entity,
+} from "./validate";
 import {
   insertBatches,
   getSnapshot,
   getLastInserted,
   deleteRow,
   updateMainValue,
+  upsertLocation,
+  deactivateLocation,
+  setOpeningBalance,
   ENTITY_LABEL,
 } from "./insert";
-import { savePending, takePending, discardPending } from "./pending";
+import {
+  savePending,
+  takePending,
+  discardPending,
+  saveSettingPending,
+  takeSettingPending,
+} from "./pending";
 import { answerQuestion } from "./ask";
 import { formatRupiah } from "./format";
+import { getSqlBot } from "./db";
+import {
+  getLocationsFresh,
+  buildLocationCtx,
+  labelMapOf,
+  type LocationInfo,
+  type LocationCtx,
+} from "./locations";
+
+// ===== Muat konteks lokasi (jalur tulis → selalu fresh dari DB) =====
+interface LoadedCtx {
+  locs: LocationInfo[];
+  ctx: LocationCtx;
+  labels: Record<string, string>;
+}
+async function loadCtx(): Promise<LoadedCtx> {
+  const sql = getSqlBot();
+  const locs = await getLocationsFresh(sql);
+  return { locs, ctx: buildLocationCtx(locs), labels: labelMapOf(locs) };
+}
+
+/** Label tampilan sebuah kode lokasi (fallback: kode di-UPPERCASE). */
+function labelOf(code: string, labels: Record<string, string>): string {
+  return labels[code] ?? code.toUpperCase();
+}
+
+/** Upah produksi Rp5.000/resep per orang (0007): berdua=10.000, sendiri=5.000. */
+function wageFor(worker: string, recipes: number): number {
+  return worker === "berdua" ? recipes * 10000 : recipes * 5000;
+}
 
 // ===== Ringkasan manusiawi untuk konfirmasi =====
-const LOC_LABEL: Record<string, string> = {
-  rumah: "Rumah",
-  mts1: "MTS1",
-  mts2: "MTS2",
-  smp: "SMP",
-  sma: "SMA",
-  smk: "SMK",
-};
-
 const WORKER_LABEL: Record<string, string> = {
   berdua: "Zummy & Aril",
   zummy: "Zummy",
   aril: "Aril",
 };
 
-function summarizeBatch(batch: ParsedBatch): string[] {
+function summarizeBatch(batch: ParsedBatch, labels: Record<string, string>): string[] {
   return batch.rows.map((r) => {
     switch (batch.entity) {
       case "production": {
         const x = r as { recipes: number; worker: string; prod_date: string };
-        const wage = x.worker === "berdua" ? x.recipes * 6000 : x.recipes * 3000;
+        const wage = wageFor(x.worker, x.recipes);
         return `🧊 Produksi ${x.recipes} resep (${x.recipes * 40} biji) oleh ${WORKER_LABEL[x.worker] ?? x.worker}, upah ${formatRupiah(wage)} · ${x.prod_date}`;
       }
       case "stock_movement": {
         const x = r as { from_loc: string; to_loc: string; qty: number; move_date: string };
-        return `🔁 Mutasi ${LOC_LABEL[x.from_loc]} → ${LOC_LABEL[x.to_loc]}: ${x.qty} biji · ${x.move_date}`;
+        return `🔁 Mutasi ${labelOf(x.from_loc, labels)} → ${labelOf(x.to_loc, labels)}: ${x.qty} biji · ${x.move_date}`;
       }
       case "sale": {
         const x = r as { canteen: string; qty: number; price_rp: number; sale_date: string };
-        return `💵 Jual ${LOC_LABEL[x.canteen]}: ${x.qty} × ${formatRupiah(x.price_rp)} = ${formatRupiah(x.qty * x.price_rp)} · ${x.sale_date}`;
+        return `💵 Jual ${labelOf(x.canteen, labels)}: ${x.qty} × ${formatRupiah(x.price_rp)} = ${formatRupiah(x.qty * x.price_rp)} · ${x.sale_date}`;
       }
       case "cash_in": {
         const x = r as { canteen: string; amount_rp: number; method: string; received_date: string };
-        return `💰 Kas masuk ${LOC_LABEL[x.canteen]}: ${formatRupiah(x.amount_rp)} (${x.method}) · ${x.received_date}`;
+        return `💰 Kas masuk ${labelOf(x.canteen, labels)}: ${formatRupiah(x.amount_rp)} (${x.method}) · ${x.received_date}`;
       }
       case "cash_out": {
         const x = r as { kind: string; category: string; amount_rp: number; out_date: string };
@@ -74,8 +110,8 @@ function summarizeBatch(batch: ParsedBatch): string[] {
   });
 }
 
-function summarizeAll(batches: ParsedBatch[]): string {
-  const lines = batches.flatMap(summarizeBatch);
+function summarizeAll(batches: ParsedBatch[], labels: Record<string, string>): string {
+  const lines = batches.flatMap((b) => summarizeBatch(b, labels));
   const head =
     lines.length === 1 ? "Konfirmasi:" : `Konfirmasi ${lines.length} operasi:`;
   return `${head}\n${lines.map((l) => `• ${l}`).join("\n")}\n\nSimpan?`;
@@ -136,6 +172,92 @@ function parseUpdateCommand(
   return { entity, id, value };
 }
 
+// ===== /setting — kelola lokasi & saldo awal =====
+// Perintah teks (bukan JSON) supaya mudah dari HP. Semua tetap lewat konfirmasi.
+//   /setting                              → tampilkan daftar & bantuan
+//   /setting lokasi <kode> "<Nama>" [harga] [batch50]
+//   /setting hapuslokasi <kode>
+//   /setting saldo <nominal> [catatan...]
+
+const SETTING_HELP =
+  "⚙️ *Pengaturan*\n\n" +
+  "Tambah/ubah kantin:\n" +
+  "`/setting lokasi <kode> <Nama> [harga] [batch50]`\n" +
+  "contoh: `/setting lokasi mts1 MTS1 1300`\n" +
+  "contoh: `/setting lokasi sma SMA 1300 batch50`\n\n" +
+  "Nonaktifkan kantin:\n" +
+  "`/setting hapuslokasi <kode>`\n\n" +
+  "Saldo awal (modal kas + nilai bahan awal):\n" +
+  "`/setting saldo <nominal> [catatan]`\n" +
+  "contoh: `/setting saldo 500rb modal awal`\n\n" +
+  "harga = uang KITA per biji (100–5000). `batch50` untuk SMA/SMK.";
+
+interface SettingLocationCmd {
+  kind: "location";
+  code: string;
+  label: string;
+  price: number | null;
+  batch50: boolean;
+}
+interface SettingDeleteCmd { kind: "delloc"; code: string }
+interface SettingSaldoCmd { kind: "saldo"; amount: number; note?: string }
+type SettingCmd =
+  | SettingLocationCmd
+  | SettingDeleteCmd
+  | SettingSaldoCmd
+  | { kind: "help" }
+  | { kind: "error"; message: string };
+
+/**
+ * Urai `/setting ...`. Hanya MENGURAI bentuk — nilai (kode/harga/nominal)
+ * divalidasi ulang zod sebelum benar-benar disimpan.
+ */
+function parseSettingCommand(text: string): SettingCmd {
+  const body = text.replace(/^\/setting(?:@\w+)?\s*/i, "").trim();
+  if (!body) return { kind: "help" };
+
+  const sub = body.split(/\s+/)[0]?.toLowerCase() ?? "";
+  const rest = body.slice(sub.length).trim();
+
+  if (sub === "lokasi") {
+    // kode, lalu Nama (boleh berspasi / dalam kutip), lalu opsi harga & batch50.
+    const tokens = rest.match(/"[^"]+"|\S+/g) ?? [];
+    if (tokens.length < 2) {
+      return { kind: "error", message: "Format: `/setting lokasi <kode> <Nama> [harga] [batch50]`" };
+    }
+    const code = tokens[0]!.toLowerCase();
+    let batch50 = false;
+    let price: number | null = null;
+    const labelParts: string[] = [];
+    for (const tk of tokens.slice(1)) {
+      const t = tk.toLowerCase();
+      if (t === "batch50" || t === "batch") { batch50 = true; continue; }
+      const asRp = parseRupiah(tk);
+      if (asRp !== null && /^\d|rb|ribu|k|jt|juta/i.test(tk)) { price = asRp; continue; }
+      labelParts.push(tk.replace(/^"|"$/g, ""));
+    }
+    const label = labelParts.join(" ").trim() || code.toUpperCase();
+    return { kind: "location", code, label, price, batch50 };
+  }
+
+  if (sub === "hapuslokasi" || sub === "nonaktif") {
+    const code = rest.split(/\s+/)[0]?.toLowerCase() ?? "";
+    if (!code) return { kind: "error", message: "Format: `/setting hapuslokasi <kode>`" };
+    return { kind: "delloc", code };
+  }
+
+  if (sub === "saldo") {
+    const m = rest.match(/^([\d.,]+\s*(?:rb|ribu|k|jt|juta)?)(?:\s+(.*))?$/i);
+    if (!m || !m[1]) return { kind: "error", message: "Format: `/setting saldo <nominal> [catatan]`" };
+    const amount = parseRupiah(m[1]);
+    if (amount === null) return { kind: "error", message: "Nominal saldo tidak dikenali." };
+    const note = m[2]?.trim();
+    return note ? { kind: "saldo", amount, note } : { kind: "saldo", amount };
+  }
+
+  return { kind: "error", message: "Sub-perintah tidak dikenal. Ketik `/setting` untuk bantuan." };
+}
+
 // ===== Bot & handler =====
 let _bot: Bot | null = null;
 
@@ -163,6 +285,8 @@ export function getBot(): Bot {
         "• kemarin mts1 kirim berapa · transaksi terakhir\n\n" +
         "Ralat:\n" +
         "• undo · hapus jual 12 · ubah jual 12 jadi 80\n\n" +
+        "Pengaturan awal:\n" +
+        "• /setting — daftarkan kantin & saldo awal\n\n" +
         "Aku selalu minta konfirmasi sebelum menyimpan/menghapus. /help untuk detail.",
     ),
   );
@@ -183,10 +307,104 @@ export function getBot(): Bot {
         "`hapus <jenis> <id>` — mis. `hapus jual 12`\n" +
         "`ubah <jenis> <id> jadi <nilai>` — mis. `ubah mutasi 5 jadi 80`\n" +
         "(jenis: produksi/mutasi/jual/uang/pengeluaran)\n\n" +
+        "⚙️ SETELAN (`/setting`):\n" +
+        "`/setting lokasi <kode> <Nama> [harga] [batch50]`\n" +
+        "`/setting hapuslokasi <kode>` · `/setting saldo <nominal> [catatan]`\n\n" +
         "Tanggal default hari ini; bisa sebut `kemarin`.",
       { parse_mode: "Markdown" },
     ),
   );
+
+  // /setting — kelola lokasi & saldo awal (tetap dengan konfirmasi).
+  bot.command("setting", async (ctx) => {
+    const cmd = parseSettingCommand(ctx.message?.text ?? "");
+
+    if (cmd.kind === "help") {
+      const { locs } = await loadCtx();
+      const canteens = locs.filter((l) => l.isCanteen && !l.isWarehouse && l.active);
+      const daftar = canteens.length
+        ? canteens
+            .map((l) => `• ${l.code} — ${l.label}${l.priceRp ? ` @${formatRupiah(l.priceRp)}` : " (harga belum diset)"}${l.isBatch50 ? " [batch50]" : ""}`)
+            .join("\n")
+        : "(belum ada kantin — tambahkan dengan `/setting lokasi ...`)";
+      await ctx.reply(`${SETTING_HELP}\n\nKantin terdaftar:\n${daftar}`, { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (cmd.kind === "error") {
+      await ctx.reply(cmd.message, { parse_mode: "Markdown" });
+      return;
+    }
+
+    if (cmd.kind === "location") {
+      const parsed = locationSettingSchema.safeParse({
+        code: cmd.code,
+        label: cmd.label,
+        price_rp: cmd.price,
+        is_batch50: cmd.batch50,
+      });
+      if (!parsed.success) {
+        await ctx.reply(
+          "Datanya belum bisa disimpan:\n" +
+            parsed.error.issues.map((i) => `⚠️ ${i.message}`).join("\n"),
+        );
+        return;
+      }
+      const d = parsed.data;
+      const pid = await saveSettingPending({ kind: "location", data: d });
+      const kb = new InlineKeyboard()
+        .text("✅ Simpan", `ss|${pid}`)
+        .text("❌ Batal", `sx|${pid}`);
+      await ctx.reply(
+        `Konfirmasi kantin:\n• Kode: ${d.code}\n• Nama: ${d.label}\n• Harga/biji: ${d.price_rp ? formatRupiah(d.price_rp) : "(belum diset)"}\n• Batch 50: ${d.is_batch50 ? "ya" : "tidak"}\n\nSimpan?`,
+        { reply_markup: kb },
+      );
+      return;
+    }
+
+    if (cmd.kind === "delloc") {
+      const { ctx: lctx, labels } = await loadCtx();
+      if (!lctx.locationSet.has(cmd.code)) {
+        await ctx.reply(`Lokasi '${cmd.code}' tidak ditemukan / sudah nonaktif.`);
+        return;
+      }
+      if (lctx.warehouseSet.has(cmd.code)) {
+        await ctx.reply(`'${cmd.code}' adalah gudang — tidak bisa dinonaktifkan.`);
+        return;
+      }
+      const ok = await deactivateLocation(cmd.code);
+      await ctx.reply(
+        ok
+          ? `🗑 Kantin ${labelOf(cmd.code, labels)} dinonaktifkan (data lama tetap aman).`
+          : `⚠️ Gagal menonaktifkan '${cmd.code}'.`,
+      );
+      return;
+    }
+
+    if (cmd.kind === "saldo") {
+      const parsed = openingBalanceSchema.safeParse({
+        saldo_awal_rp: cmd.amount,
+        note: cmd.note,
+      });
+      if (!parsed.success) {
+        await ctx.reply(
+          "Datanya belum bisa disimpan:\n" +
+            parsed.error.issues.map((i) => `⚠️ ${i.message}`).join("\n"),
+        );
+        return;
+      }
+      const d = parsed.data;
+      const pid = await saveSettingPending({ kind: "opening_balance", data: d });
+      const kb = new InlineKeyboard()
+        .text("✅ Simpan", `ss|${pid}`)
+        .text("❌ Batal", `sx|${pid}`);
+      await ctx.reply(
+        `Konfirmasi saldo awal:\n• Nominal: ${formatRupiah(d.saldo_awal_rp)}${d.note ? `\n• Catatan: ${d.note}` : ""}\n\nIni baseline modal (sekali isi, bisa dikoreksi). Simpan?`,
+        { reply_markup: kb },
+      );
+      return;
+    }
+  });
 
   // Pesan teks bebas → routing: revisi → pertanyaan → input.
   bot.on("message:text", async (ctx) => {
@@ -265,7 +483,8 @@ export function getBot(): Bot {
     // ---- 4. Pertanyaan (jalur baca) ----
     if (isQuestion(lower)) {
       try {
-        const answer = await answerQuestion(lower);
+        const { ctx: lctx, labels } = await loadCtx();
+        const answer = await answerQuestion(lower, lctx, labels);
         await ctx.reply(answer, { parse_mode: "Markdown" });
       } catch {
         await ctx.reply("Maaf, gagal mengambil laporan. Coba lagi sebentar.");
@@ -274,9 +493,10 @@ export function getBot(): Bot {
     }
 
     // ---- 5. Input transaksi (multi-op) ----
+    const { ctx: lctx, labels } = await loadCtx();
     let rawBatches;
     try {
-      rawBatches = await parseMessage(text);
+      rawBatches = await parseMessage(text, lctx);
     } catch {
       await ctx.reply(
         "Maaf, aku belum paham catatan itu 🙏\n\n" +
@@ -291,7 +511,7 @@ export function getBot(): Bot {
       return;
     }
 
-    const result = validateBatches(rawBatches);
+    const result = validateBatches(rawBatches, lctx);
     if (!result.ok) {
       await ctx.reply(
         "Datanya belum bisa disimpan:\n" +
@@ -313,7 +533,7 @@ export function getBot(): Bot {
       .text("✅ Simpan", `s|${pendingId}`)
       .text("❌ Batal", `x|${pendingId}`);
 
-    await ctx.reply(summarizeAll(result.batches), { reply_markup: kb });
+    await ctx.reply(summarizeAll(result.batches, labels), { reply_markup: kb });
   });
 
   // Tombol konfirmasi: s|<pendingId>, x|<pendingId?>, d|<entity>|<id>, u|<entity>|<id>|<val>
@@ -324,7 +544,7 @@ export function getBot(): Bot {
 
     try {
       // ---- Batal ----
-      if (action === "x") {
+      if (action === "x" || action === "sx") {
         const pid = parts[1];
         if (pid) await discardPending(pid).catch(() => {});
         await ctx.answerCallbackQuery({ text: "Dibatalkan" });
@@ -332,10 +552,36 @@ export function getBot(): Bot {
         return;
       }
 
+      // ---- Simpan pengaturan (lokasi / saldo awal) ----
+      if (action === "ss") {
+        const pid = parts[1] ?? "";
+        const s = await takeSettingPending(pid);
+        if (!s.ok) {
+          await ctx.answerCallbackQuery({ text: "Kedaluwarsa" });
+          await ctx.editMessageText(
+            s.reason === "notfound"
+              ? "⚠️ Konfirmasi kedaluwarsa / sudah dipakai. Ketik ulang perintahnya ya."
+              : "⚠️ Data konfirmasi tidak valid. Ketik ulang perintahnya ya.",
+          );
+          return;
+        }
+        if (s.kind === "location") {
+          await upsertLocation(s.data);
+          await ctx.answerCallbackQuery({ text: "Tersimpan ✅" });
+          await ctx.editMessageText(`✅ Kantin ${s.data.label} (${s.data.code}) disimpan.`);
+        } else {
+          await setOpeningBalance(s.data);
+          await ctx.answerCallbackQuery({ text: "Tersimpan ✅" });
+          await ctx.editMessageText(`✅ Saldo awal disimpan: ${formatRupiah(s.data.saldo_awal_rp)}.`);
+        }
+        return;
+      }
+
       // ---- Simpan batch dari pending ----
       if (action === "s") {
         const pid = parts[1] ?? "";
-        const pending = await takePending(pid);
+        const { ctx: lctx } = await loadCtx();
+        const pending = await takePending(pid, lctx);
         if (!pending.ok) {
           await ctx.answerCallbackQuery({ text: "Kedaluwarsa" });
           await ctx.editMessageText(

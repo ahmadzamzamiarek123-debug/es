@@ -16,20 +16,14 @@ import {
   getExpenseComposition,
   getNeedsCheck,
   getRecentTransactions,
+  getLocationLabels,
+  labelOf,
 } from "@/lib/reports";
 import { rp, rpk } from "@/lib/format";
 import { OmzetArea, KantinBars, ExpenseDonut } from "@/components/charts";
 import { BottomNav, IceLogout } from "@/components/nav";
 
 export const dynamic = "force-dynamic";
-
-const LOC_LABEL: Record<string, string> = {
-  mts1: "MTS1",
-  mts2: "MTS2",
-  smp: "SMP",
-  sma: "SMA",
-  smk: "SMK",
-};
 
 const PERIOD_LABEL: Record<Period, string> = {
   hari: "Hari ini",
@@ -59,7 +53,7 @@ export default async function DashboardPage({
   const { start, end } = periodRange(period);
 
   // Ambil semua data paralel (read-only).
-  const [summary, daily, byCanteen, expenses, needsCheck, recent] =
+  const [summary, daily, byCanteen, expenses, needsCheck, recent, labels] =
     await Promise.all([
       getSummary(start, end),
       getDailyOmzet(start, end),
@@ -67,6 +61,7 @@ export default async function DashboardPage({
       getExpenseComposition(start, end),
       getNeedsCheck(start, end),
       getRecentTransactions(start, end, 8),
+      getLocationLabels(),
     ]);
 
   // Kantin dengan selisih omzet vs kas masuk signifikan → tampilkan alert.
@@ -132,7 +127,7 @@ export default async function DashboardPage({
               <b>Perlu dicek:</b> ada kantin dengan penjualan lebih besar dari kas
               yang masuk (mungkin belum dibayar):{" "}
               {flagged
-                .map((c) => `${LOC_LABEL[c.canteen]} (${rpk(c.selisih)})`)
+                .map((c) => `${labelOf(c.canteen, labels)} (${rpk(c.selisih)})`)
                 .join(", ")}
               . Lihat detail di{" "}
               <a href="/transaksi" style={{ color: "#5e3e14", fontWeight: 700 }}>
@@ -154,7 +149,7 @@ export default async function DashboardPage({
         <div className="card">
           <p className="ct">Penjualan per kantin</p>
           <p className="cs">Kontribusi tiap lokasi</p>
-          <KantinBars data={byCanteen} />
+          <KantinBars data={byCanteen} labels={labels} />
         </div>
 
         {/* KOMPOSISI BIAYA */}

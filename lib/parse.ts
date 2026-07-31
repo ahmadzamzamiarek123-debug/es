@@ -7,16 +7,17 @@
 // terurai regex → hasil regex dipakai; bila ada yang gagal → SELURUH pesan
 // dilempar ke Gemini (hindari dobel hitung antara regex & AI).
 //
+// CATATAN: daftar lokasi kini DINAMIS (tabel location_ref). Semua fungsi parse
+// menerima `LocationCtx` (dari lib/locations.ts) untuk normalisasi alias, harga
+// default per kantin, gudang default, dan aturan batch 50 — tidak ada lagi
+// konstanta lokasi/harga yang di-hardcode di sini.
+//
 // Prinsip: parser tidak menyentuh DB & tidak memutuskan simpan.
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { todayJakarta, resolveRelativeDate } from "./dates";
-import {
-  CANTEENS,
-  LOCATIONS,
-  isBatch50Canteen,
-  type Entity,
-} from "./validate";
+import type { Entity } from "./validate";
+import type { LocationCtx } from "./locations";
 
 // Bentuk longgar hasil parse (belum tervalidasi).
 export interface RawBatch {
@@ -24,34 +25,18 @@ export interface RawBatch {
   rows: Record<string, unknown>[];
 }
 
-// Harga jual default per kantin (rupiah/biji). Bukan hardcode transaksi —
-// hanya dipakai bila user tak menyebut harga; nilai final tetap disimpan
-// per baris di price_rp. (PROJECT.md §2: SMA=800, lainnya=900.)
-const DEFAULT_PRICE: Record<string, number> = {
-  mts1: 900,
-  mts2: 900,
-  smp: 900,
-  sma: 800,
-  smk: 900,
-};
-
-// Alias lokasi yang mungkin diketik user → enum kanonik.
-const LOC_ALIAS: Record<string, string> = {
-  rumah: "rumah",
-  gudang: "rumah",
-  mts1: "mts1",
-  "mts 1": "mts1",
-  mts2: "mts2",
-  "mts 2": "mts2",
-  smp: "smp",
-  sma: "sma",
-  smk: "smk",
-};
-
-function normalizeLoc(s: string): string | null {
+/** Normalisasi ketikan lokasi → kode kanonik lewat alias ctx (dinamis). */
+function normalizeLoc(s: string, ctx: LocationCtx): string | null {
   const key = s.trim().toLowerCase();
-  if (LOC_ALIAS[key]) return LOC_ALIAS[key];
-  if ((LOCATIONS as readonly string[]).includes(key)) return key;
+  const alias = ctx.aliasMap.get(key);
+  if (alias) return alias;
+  if (ctx.locationSet.has(key)) return key;
+  return null;
+}
+
+/** Gudang default (sumber kiriman bila asal tak disebut) = gudang pertama. */
+function defaultWarehouse(ctx: LocationCtx): string | null {
+  for (const code of ctx.warehouseSet) return code;
   return null;
 }
 
@@ -120,7 +105,6 @@ export function isQuestion(text: string): boolean {
   // "cek stok", "laporan hari ini", "ringkasan" tanpa kata input → tanya.
   return !INPUT_HINTS.test(t);
 }
-
 // ===== Regex per operasi =====
 
 // Pemisah antar operasi dalam satu pesan.
@@ -143,12 +127,13 @@ function parseWorker(seg: string): string {
  * Coba parse SATU potongan operasi dengan regex (tanpa AI).
  * Mengembalikan RawBatch bila salah satu pola cocok, atau null.
  */
-export function parseWithRegex(text: string): RawBatch | null {
+export function parseWithRegex(text: string, ctx: LocationCtx): RawBatch | null {
   const raw = text.trim();
   if (!raw) return null;
   const lower = raw.toLowerCase();
   // Tanggal default hari ini (Asia/Jakarta), atau "kemarin"/"lusa" bila disebut.
   const date = resolveRelativeDate(lower) ?? todayJakarta();
+  const warehouse = defaultWarehouse(ctx);
 
   // ----- PRODUKSI: "produksi 6 resep [sendiri|sama aril]" -----
   const prod = lower.match(/(?:produksi|buat|bikin)\s+(\d+)\s*resep/);
@@ -170,8 +155,8 @@ export function parseWithRegex(text: string): RawBatch | null {
     /(?:kirim|lempar|pindah)\s+([a-z0-9 ]+?)\s*(?:->|ke|>)\s*([a-z0-9 ]+?)\s+(\d+)\b/,
   );
   if (move && move[1] && move[2] && move[3]) {
-    const from = normalizeLoc(move[1]);
-    const to = normalizeLoc(move[2]);
+    const from = normalizeLoc(move[1], ctx);
+    const to = normalizeLoc(move[2], ctx);
     if (from && to) {
       return {
         entity: "stock_movement",
@@ -182,31 +167,31 @@ export function parseWithRegex(text: string): RawBatch | null {
     }
   }
 
-  // ----- MUTASI "kirim 100 ke mts1" (asal default rumah) -----
+  // ----- MUTASI "kirim 100 ke mts1" (asal default gudang) -----
   const moveTo = lower.match(/(?:kirim|lempar|pindah)\s+(\d+)\s+ke\s+([a-z0-9 ]+)\b/);
-  if (moveTo && moveTo[1] && moveTo[2]) {
-    const to = normalizeLoc(moveTo[2]);
-    if (to && to !== "rumah") {
+  if (moveTo && moveTo[1] && moveTo[2] && warehouse) {
+    const to = normalizeLoc(moveTo[2], ctx);
+    if (to && to !== warehouse) {
       return {
         entity: "stock_movement",
         rows: [
-          // ASUMSI: tanpa asal disebut, kiriman berangkat dari rumah (gudang).
-          { move_date: date, from_loc: "rumah", to_loc: to, qty: parseInt(moveTo[1], 10) },
+          // ASUMSI: tanpa asal disebut, kiriman berangkat dari gudang.
+          { move_date: date, from_loc: warehouse, to_loc: to, qty: parseInt(moveTo[1], 10) },
         ],
       };
     }
   }
 
-  // ----- MUTASI "mts1 kirim 100" (tujuan di depan; asal default rumah) -----
+  // ----- MUTASI "mts1 kirim 100" (tujuan di depan; asal default gudang) -----
   const locFirst = lower.match(/^([a-z0-9 ]+?)\s+(?:kirim|dikirim|lempar|dilempar)\s+(\d+)\b/);
-  if (locFirst && locFirst[1] && locFirst[2]) {
-    const to = normalizeLoc(locFirst[1]);
-    if (to && to !== "rumah") {
+  if (locFirst && locFirst[1] && locFirst[2] && warehouse) {
+    const to = normalizeLoc(locFirst[1], ctx);
+    if (to && to !== warehouse) {
       return {
         entity: "stock_movement",
         rows: [
-          // ASUMSI: "mts1 kirim 100" = 100 biji dikirim KE mts1 dari rumah.
-          { move_date: date, from_loc: "rumah", to_loc: to, qty: parseInt(locFirst[2], 10) },
+          // ASUMSI: "mts1 kirim 100" = 100 biji dikirim KE mts1 dari gudang.
+          { move_date: date, from_loc: warehouse, to_loc: to, qty: parseInt(locFirst[2], 10) },
         ],
       };
     }
@@ -215,9 +200,9 @@ export function parseWithRegex(text: string): RawBatch | null {
   // ----- KAS MASUK: "uang mts1 90rb" / "terima smk 45000" -----
   const cashIn = lower.match(/(?:uang|terima|bayar(?:an)?)\s+([a-z0-9 ]+?)\s+([\d.,]+\s*(?:rb|ribu|k|jt|juta)?)\b/);
   if (cashIn && cashIn[1] && cashIn[2]) {
-    const canteen = normalizeLoc(cashIn[1]);
+    const canteen = normalizeLoc(cashIn[1], ctx);
     const amount = parseRupiah(cashIn[2]);
-    if (canteen && canteen !== "rumah" && amount !== null) {
+    if (canteen && ctx.canteenSet.has(canteen) && amount !== null) {
       return {
         entity: "cash_in",
         rows: [
@@ -270,20 +255,20 @@ export function parseWithRegex(text: string): RawBatch | null {
     }
   }
 
-  // ----- PENJUALAN: "jual sma 50 @800" / "jual mts1 100" / "jual smk batch 50" -----
+  // ----- PENJUALAN: "jual sma 50 @1300" / "jual mts1 100" / "jual smk batch 50" -----
   const jual = lower.match(
     /jual\s+([a-z0-9 ]+?)\s+(?:batch\s+)?(\d+)(?:\s*@\s*([\d.,]+))?/,
   );
   if (jual && jual[1] && jual[2]) {
-    const canteen = normalizeLoc(jual[1]);
-    if (canteen && canteen !== "rumah") {
+    const canteen = normalizeLoc(jual[1], ctx);
+    if (canteen && ctx.canteenSet.has(canteen)) {
       const qty = parseInt(jual[2], 10);
       const price =
         jual[3] !== undefined
           ? parseRupiah(jual[3])
-          : DEFAULT_PRICE[canteen] ?? null;
+          : ctx.defaultPrice.get(canteen) ?? null;
       if (price !== null) {
-        const isBatch = isBatch50Canteen(canteen);
+        const isBatch = ctx.batch50Set.has(canteen);
         return {
           entity: "sale",
           rows: [
@@ -309,7 +294,7 @@ export function parseWithRegex(text: string): RawBatch | null {
  * yang gagal, kembalikan null (pemanggil fallback ke Gemini untuk seluruh
  * pesan, supaya tidak dobel hitung).
  */
-export function parseMultiWithRegex(text: string): RawBatch[] | null {
+export function parseMultiWithRegex(text: string, ctx: LocationCtx): RawBatch[] | null {
   const segments = text
     .split(SEGMENT_SPLIT)
     .map((s) => s.trim())
@@ -318,7 +303,7 @@ export function parseMultiWithRegex(text: string): RawBatch[] | null {
 
   const batches: RawBatch[] = [];
   for (const seg of segments) {
-    const b = parseWithRegex(seg);
+    const b = parseWithRegex(seg, ctx);
     if (!b) return null; // ada potongan tak terurai → serahkan ke Gemini
     batches.push(b);
   }
@@ -327,8 +312,23 @@ export function parseMultiWithRegex(text: string): RawBatch[] | null {
 
 // ===== Fallback Gemini untuk kalimat bebas =====
 
-// Kontrak JSON multi-operasi. Output tetap divalidasi zod setelahnya.
-const SYSTEM_PROMPT = `Kamu pengurai catatan usaha es lilin. Ubah pesan bahasa Indonesia menjadi JSON.
+/**
+ * Bangun system prompt dinamis dari daftar lokasi aktif (ctx).
+ * Daftar lokasi, harga default, dan kantin batch 50 diambil dari DB — tidak
+ * ada lagi yang di-hardcode, supaya /setting langsung memengaruhi parsing.
+ */
+function buildSystemPrompt(ctx: LocationCtx): string {
+  const canteens = [...ctx.canteenSet].sort();
+  const warehouses = [...ctx.warehouseSet].sort();
+  const allLocs = [...ctx.locationSet].sort();
+  const batch50 = [...ctx.batch50Set].sort();
+  const priceLines = canteens
+    .map((c) => `${c}=${ctx.defaultPrice.get(c) ?? "?"}`)
+    .join(", ");
+  const warehouseLine =
+    warehouses.length > 0 ? warehouses.join("/") : "(belum ada gudang)";
+
+  return `Kamu pengurai catatan usaha es lilin. Ubah pesan bahasa Indonesia menjadi JSON.
 Satu pesan bisa berisi BEBERAPA operasi. Bentuk WAJIB:
 {"ops": [ {"entity": "...", "rows": [ {...} ]} ]}
 entity salah satu: production | stock_movement | sale | cash_in | cash_out.
@@ -339,11 +339,12 @@ Kolom per entity:
 - sale: sale_date, canteen, qty(int), price_rp(int rupiah), note?
 - cash_in: received_date, canteen, amount_rp(int), method(cash|transfer), note?
 - cash_out: out_date, kind(pengeluaran|pengambilan), category(bahan|gas_listrik|plastik|transport|spp_ayah|lainnya), amount_rp(int), note?
-Lokasi valid: rumah, mts1, mts2, smp, sma, smk. canteen tidak boleh 'rumah'.
-"X kirim 100" atau "kirim 100 ke X" = stock_movement dari rumah ke X.
+Lokasi valid: ${allLocs.join(", ")}. canteen HANYA boleh salah satu kantin: ${canteens.join(", ")}.
+Gudang (bukan kantin): ${warehouseLine}. canteen tidak boleh berupa gudang.
+"X kirim 100" atau "kirim 100 ke X" = stock_movement dari gudang (${warehouseLine}) ke X.
 "sisa N dilempar/dipindah ke Y" (dalam konteks lokasi X) = stock_movement dari X ke Y sebanyak N.
-Harga default per biji: sma=800, lainnya=900 (pakai bila tak disebut).
-SMA & SMK memakai batch 50: qty penjualan kelipatan 50.
+Harga default per biji (pakai bila tak disebut): ${priceLines || "(belum diset)"}.
+Kantin batch 50 (qty penjualan kelipatan 50): ${batch50.length ? batch50.join(", ") : "(tidak ada)"}.
 "ambil ayah"/"pengambilan" = cash_out kind=pengambilan (category spp_ayah bila terkait ayah/SPP).
 Tanggal: "tanggal 14"/"tgl 14"/"14 juli" → pakai bulan & tahun berjalan bila tak lengkap.
 Uang berupa integer rupiah tanpa desimal (20rb=20000, 1,5jt=1500000).
@@ -351,12 +352,13 @@ ATURAN PALING PENTING: JANGAN PERNAH mengarang atau menebak angka (qty/harga/nom
 Jika jumlah tidak disebut eksplisit (mis. "sudah terjual" tanpa angka), JANGAN buat operasi
 penjualan/kas untuk itu — LEWATI. Lebih baik menghasilkan sedikit operasi yang pasti daripada menebak.
 Jawab HANYA JSON, tanpa penjelasan.`;
+}
 
 /**
  * Fallback ke Gemini: seluruh pesan → daftar operasi.
  * Melempar error bila API key tak ada atau output tak bisa dipakai.
  */
-export async function parseWithGemini(text: string): Promise<RawBatch[]> {
+export async function parseWithGemini(text: string, ctx: LocationCtx): Promise<RawBatch[]> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY belum diset");
@@ -365,7 +367,7 @@ export async function parseWithGemini(text: string): Promise<RawBatch[]> {
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
     model: process.env.GEMINI_MODEL ?? "gemini-2.0-flash",
-    systemInstruction: SYSTEM_PROMPT,
+    systemInstruction: buildSystemPrompt(ctx),
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0,
@@ -410,10 +412,8 @@ export async function parseWithGemini(text: string): Promise<RawBatch[]> {
  * Titik masuk utama: multi-op regex dulu, baru Gemini untuk seluruh pesan.
  * Selalu mengembalikan daftar RawBatch (belum tervalidasi).
  */
-export async function parseMessage(text: string): Promise<RawBatch[]> {
-  const byRegex = parseMultiWithRegex(text);
+export async function parseMessage(text: string, ctx: LocationCtx): Promise<RawBatch[]> {
+  const byRegex = parseMultiWithRegex(text, ctx);
   if (byRegex) return byRegex;
-  return parseWithGemini(text);
+  return parseWithGemini(text, ctx);
 }
-
-export { DEFAULT_PRICE, CANTEENS };

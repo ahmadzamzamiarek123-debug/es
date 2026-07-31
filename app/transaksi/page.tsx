@@ -6,19 +6,11 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { checkToken, AUTH_COOKIE } from "@/lib/auth";
 import { parsePeriod, periodRange, type Period } from "@/lib/dates";
-import { getRecentTransactions, getNeedsCheck } from "@/lib/reports";
+import { getRecentTransactions, getNeedsCheck, getLocationLabels, labelOf } from "@/lib/reports";
 import { rp, rpk } from "@/lib/format";
 import { BottomNav } from "@/components/nav";
 
 export const dynamic = "force-dynamic";
-
-const LOC_LABEL: Record<string, string> = {
-  mts1: "MTS1",
-  mts2: "MTS2",
-  smp: "SMP",
-  sma: "SMA",
-  smk: "SMK",
-};
 
 const PERIOD_LABEL: Record<Period, string> = {
   hari: "Hari ini",
@@ -64,9 +56,10 @@ export default async function TransaksiPage({
   const kind = k ?? "all";
   const { start, end } = periodRange(period);
 
-  const [all, needsCheck] = await Promise.all([
+  const [all, needsCheck, labels] = await Promise.all([
     getRecentTransactions(start, end, 200),
     getNeedsCheck(start, end),
+    getLocationLabels(),
   ]);
 
   const rows = kind === "all" ? all : all.filter((t) => t.kind === kind);
@@ -123,7 +116,7 @@ export default async function TransaksiPage({
                     👁️
                   </div>
                   <div className="tm">
-                    <b>{LOC_LABEL[c.canteen]}</b>
+                    <b>{labelOf(c.canteen, labels)}</b>
                     <span>
                       Omzet {rpk(c.omzet)} · masuk {rpk(c.kasMasuk)}
                     </span>

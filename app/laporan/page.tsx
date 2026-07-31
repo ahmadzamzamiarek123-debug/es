@@ -65,6 +65,7 @@ export default async function LaporanPage({
     { label: "Upah Zummy", value: -s.upahZummy, kind: "out" },
     { label: "Upah Aril", value: -s.upahAril, kind: "out" },
     { label: "Laba usaha", value: s.labaUsaha, kind: "sum" },
+    { label: "Saldo awal (modal)", value: s.saldoAwal, kind: "in" },
     { label: "Pengambilan (owner draw)", value: -s.pengambilan, kind: "draw" },
     { label: "Kas tersisa", value: s.kasTersisa, kind: "sum" },
   ];
@@ -96,7 +97,8 @@ export default async function LaporanPage({
           <p className="cs">Kas tersisa {monthLabel(month)}</p>
           <p className="report-kas">{rp(s.kasTersisa)}</p>
           <p className="cs">
-            Laba usaha {rp(s.labaUsaha)} − pengambilan {rp(s.pengambilan)}
+            Saldo awal {rp(s.saldoAwal)} + laba usaha {rp(s.labaUsaha)} −
+            pengambilan {rp(s.pengambilan)}
           </p>
         </div>
 

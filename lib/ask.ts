@@ -6,26 +6,29 @@
  * untuk pola umum). SQL selalu tagged-template berparameter — teks user tidak
  * pernah disambung ke SQL. Gemini TIDAK dipakai di jalur ini sama sekali:
  * pertanyaan di luar pola dijawab dengan bantuan format yang didukung.
+ *
+ * Daftar lokasi & label kini DINAMIS (LocationCtx dari lib/locations.ts).
  */
 import { getSqlBot } from "./db";
 import { todayJakarta, daysAgoJakarta } from "./dates";
 import { rp } from "./format";
-import { LOCATIONS } from "./validate";
+import type { LocationCtx } from "./locations";
 
-const LOC_LABEL: Record<string, string> = {
-  rumah: "Rumah",
-  mts1: "MTS1",
-  mts2: "MTS2",
-  smp: "SMP",
-  sma: "SMA",
-  smk: "SMK",
-};
+/** Label tampilan sebuah kode lokasi (fallback: kode di-UPPERCASE). */
+function labelOf(code: string, labels: Record<string, string>): string {
+  return labels[code] ?? code.toUpperCase();
+}
 
-/** Temukan lokasi yang disebut dalam teks ("mts 1" → mts1). */
-function findLocation(text: string): string | null {
-  const t = text.toLowerCase().replace(/mts\s+1/g, "mts1").replace(/mts\s+2/g, "mts2");
-  for (const loc of LOCATIONS) {
-    if (new RegExp(`\\b${loc}\\b`).test(t)) return loc;
+/** Temukan lokasi yang disebut dalam teks lewat alias ctx ("mts 1" → mts1). */
+function findLocation(text: string, ctx: LocationCtx): string | null {
+  const t = text.toLowerCase();
+  // Cek alias terpanjang dulu agar "mts 1" menang atas potongan pendek.
+  const aliases = [...ctx.aliasMap.keys()].sort((a, b) => b.length - a.length);
+  for (const alias of aliases) {
+    const esc = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`(?:^|\\b)${esc}(?:\\b|$)`).test(t)) {
+      return ctx.aliasMap.get(alias) ?? null;
+    }
   }
   return null;
 }
@@ -41,28 +44,38 @@ function findDate(text: string): { date: string; label: string } {
 }
 
 /**
- * Stok fisik per lokasi = masuk (produksi utk rumah + mutasi masuk)
- * − mutasi keluar − terjual. SMA/SMK batch-50: stok fisik tidak dilacak.
+ * Stok fisik per lokasi = masuk (produksi utk gudang + mutasi masuk)
+ * − mutasi keluar − terjual. Kantin batch-50: stok fisik tidak dilacak.
+ * Daftar lokasi yang dilacak diambil dari location_ref (gudang + non-batch50).
  */
-export async function stockReport(): Promise<string> {
+export async function stockReport(ctx: LocationCtx, labels: Record<string, string>): Promise<string> {
   const sql = getSqlBot();
   const rows = (await sql`
-    WITH locs AS (SELECT unnest(ARRAY['rumah','mts1','mts2','smp']::location[]) AS loc)
+    WITH locs AS (
+      SELECT code AS loc, is_warehouse
+      FROM location_ref
+      WHERE active = true AND is_batch50 = false
+    )
     SELECT
-      l.loc::text AS loc,
-      COALESCE((SELECT SUM(output_pieces) FROM production WHERE l.loc = 'rumah'), 0)::int
+      l.loc AS loc,
+      COALESCE((SELECT SUM(output_pieces) FROM production WHERE l.is_warehouse), 0)::int
         AS produced,
       COALESCE((SELECT SUM(qty) FROM stock_movement m WHERE m.to_loc = l.loc), 0)::int AS moved_in,
       COALESCE((SELECT SUM(qty) FROM stock_movement m WHERE m.from_loc = l.loc), 0)::int AS moved_out,
       COALESCE((SELECT SUM(qty) FROM sale s WHERE s.canteen = l.loc), 0)::int AS sold
     FROM locs l
+    ORDER BY l.is_warehouse DESC, l.loc
   `) as { loc: string; produced: number; moved_in: number; moved_out: number; sold: number }[];
 
   const lines = rows.map((r) => {
     const stock = r.produced + r.moved_in - r.moved_out - r.sold;
-    return `• ${LOC_LABEL[r.loc] ?? r.loc}: ${stock} biji`;
+    return `• ${labelOf(r.loc, labels)}: ${stock} biji`;
   });
-  lines.push("• SMA & SMK: batch 50 — stok fisik tidak dilacak");
+  // Catatan batch-50 dinamis (kantin yang stoknya tidak dilacak).
+  const b50 = [...ctx.batch50Set].map((c) => labelOf(c, labels));
+  if (b50.length) {
+    lines.push(`• ${b50.join(" & ")}: batch 50 — stok fisik tidak dilacak`);
+  }
   return `📦 Stok saat ini:\n${lines.join("\n")}`;
 }
 
@@ -99,18 +112,20 @@ export async function movementReport(
   loc: string,
   date: string,
   label: string,
+  labels: Record<string, string>,
 ): Promise<string> {
   const sql = getSqlBot();
+  // from_loc/to_loc kini text (FK ke location_ref) — tanpa cast ::location.
   const rows = (await sql`
     SELECT
-      COALESCE(SUM(CASE WHEN to_loc = ${loc}::location THEN qty END), 0)::int AS masuk,
-      COALESCE(SUM(CASE WHEN from_loc = ${loc}::location THEN qty END), 0)::int AS keluar
+      COALESCE(SUM(CASE WHEN to_loc = ${loc} THEN qty END), 0)::int AS masuk,
+      COALESCE(SUM(CASE WHEN from_loc = ${loc} THEN qty END), 0)::int AS keluar
     FROM stock_movement WHERE move_date = ${date}
   `) as { masuk: number; keluar: number }[];
   const r = rows[0];
   const masuk = r?.masuk ?? 0;
   const keluar = r?.keluar ?? 0;
-  const name = LOC_LABEL[loc] ?? loc;
+  const name = labelOf(loc, labels);
   return `🔁 Mutasi ${name} ${label} (${date}):\n• Masuk: ${masuk} biji\n• Keluar: ${keluar} biji`;
 }
 
@@ -119,14 +134,15 @@ export async function saleReport(
   loc: string,
   date: string,
   label: string,
+  labels: Record<string, string>,
 ): Promise<string> {
   const sql = getSqlBot();
   const rows = (await sql`
     SELECT COALESCE(SUM(qty),0)::int AS qty, COALESCE(SUM(total_rp),0)::int AS total
-    FROM sale WHERE canteen = ${loc}::location AND sale_date = ${date}
+    FROM sale WHERE canteen = ${loc} AND sale_date = ${date}
   `) as { qty: number; total: number }[];
   const r = rows[0];
-  const name = LOC_LABEL[loc] ?? loc;
+  const name = labelOf(loc, labels);
   return `💵 Penjualan ${name} ${label} (${date}): ${r?.qty ?? 0} biji — ${rp(r?.total ?? 0)}`;
 }
 
@@ -178,19 +194,24 @@ const HELP_TEXT =
 /**
  * Router pertanyaan → jawaban. Pola tak dikenal → daftar bantuan (tanpa AI:
  * jalur baca sengaja deterministik agar aman & hemat kuota).
+ * `ctx` + `labels` = daftar lokasi & label dinamis dari location_ref.
  */
-export async function answerQuestion(text: string): Promise<string> {
+export async function answerQuestion(
+  text: string,
+  ctx: LocationCtx,
+  labels: Record<string, string>,
+): Promise<string> {
   const t = text.toLowerCase();
   const { date, label } = findDate(t);
-  const loc = findLocation(t);
+  const loc = findLocation(t, ctx);
 
-  if (/\bstok\b/.test(t) && !loc) return stockReport();
+  if (/\bstok\b/.test(t) && !loc) return stockReport(ctx, labels);
   if (/transaksi terakhir|riwayat/.test(t)) return recentReport();
   if (/ringkasan|laporan|total/.test(t) && !loc) return dayReport(date, label);
 
   if (loc) {
-    if (/\bkirim\b|\bmutasi\b|\bstok\b/.test(t)) return movementReport(loc, date, label);
-    if (/\bjual\b|\bpenjualan\b|\blaku\b/.test(t)) return saleReport(loc, date, label);
+    if (/\bkirim\b|\bmutasi\b|\bstok\b/.test(t)) return movementReport(loc, date, label, labels);
+    if (/\bjual\b|\bpenjualan\b|\blaku\b/.test(t)) return saleReport(loc, date, label, labels);
     return dayReport(date, label);
   }
 

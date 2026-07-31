@@ -7,24 +7,10 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { checkToken, AUTH_COOKIE } from "@/lib/auth";
 import { todayJakarta, daysAgoJakarta } from "@/lib/dates";
-import { getStockReport } from "@/lib/reports";
+import { getStockReport, getLocationLabels, labelOf } from "@/lib/reports";
 import { BottomNav, IceLogout } from "@/components/nav";
 
 export const dynamic = "force-dynamic";
-
-const LOC_LABEL: Record<string, string> = {
-  rumah: "Rumah (gudang)",
-  mts1: "MTS1",
-  mts2: "MTS2",
-  smp: "SMP",
-};
-
-const LOC_ICON: Record<string, string> = {
-  rumah: "🏠",
-  mts1: "🏫",
-  mts2: "🏫",
-  smp: "🏫",
-};
 
 export default async function StokPage() {
   const jar = await cookies();
@@ -32,9 +18,14 @@ export default async function StokPage() {
 
   const today = todayJakarta();
   const yesterday = daysAgoJakarta(1);
-  const report = await getStockReport(today, yesterday);
+  const [report, labels] = await Promise.all([
+    getStockReport(today, yesterday),
+    getLocationLabels(),
+  ]);
 
   const totalSisa = report.stocks.reduce((a, s) => a + s.sisa, 0);
+  // Gudang = baris pertama (query ORDER BY is_warehouse DESC). Ikon rumah vs kantin.
+  const batch50Label = report.batch50.map((c) => labelOf(c, labels)).join(" & ");
 
   return (
     <div className="app">
@@ -86,13 +77,13 @@ export default async function StokPage() {
         <div className="card">
           <p className="ct">Sisa stok per lokasi</p>
           <p className="cs">masuk − keluar − terjual (sepanjang waktu)</p>
-          {report.stocks.map((s) => (
+          {report.stocks.map((s, i) => (
             <div className="tx" key={s.loc}>
               <div className="ti" style={{ background: "#e7f1fe", color: "#2b6fd6" }}>
-                {LOC_ICON[s.loc] ?? "📦"}
+                {i === 0 ? "🏠" : "🏫"}
               </div>
               <div className="tm">
-                <b>{LOC_LABEL[s.loc] ?? s.loc}</b>
+                <b>{labelOf(s.loc, labels)}{i === 0 ? " (gudang)" : ""}</b>
                 <span>
                   masuk {s.masuk} · keluar {s.keluar}
                   {s.terjual > 0 ? ` · terjual ${s.terjual}` : ""}
@@ -103,17 +94,19 @@ export default async function StokPage() {
               </div>
             </div>
           ))}
-          <div className="tx">
-            <div className="ti" style={{ background: "#eeeafb", color: "#7a69d9" }}>🧺</div>
-            <div className="tm">
-              <b>
-                SMA &amp; SMK
-                <span className="tag mut">batch 50</span>
-              </b>
-              <span>stok fisik tidak dilacak — penjualan kelipatan 50</span>
+          {report.batch50.length > 0 && (
+            <div className="tx">
+              <div className="ti" style={{ background: "#eeeafb", color: "#7a69d9" }}>🧺</div>
+              <div className="tm">
+                <b>
+                  {batch50Label}
+                  <span className="tag mut">batch 50</span>
+                </b>
+                <span>stok fisik tidak dilacak — penjualan kelipatan 50</span>
+              </div>
+              <div className="tv" style={{ color: "#6b7385" }}>—</div>
             </div>
-            <div className="tv" style={{ color: "#6b7385" }}>—</div>
-          </div>
+          )}
           {report.stocks.some((s) => s.sisa < 0) && (
             <p className="empty" style={{ color: "#e5615a" }}>
               ⚠️ Ada lokasi dengan stok minus — kemungkinan ada input yang

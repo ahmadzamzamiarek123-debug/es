@@ -4,15 +4,28 @@
 // browser sama sekali. Gaya visual tetap meniru design/ui-mockup.html.
 
 import { rp, rpk } from "@/lib/format";
+import { labelOf } from "@/lib/reports";
 
-// Warna per kantin — samakan dengan K_COLORS di mockup.
-const CANTEEN_COLORS: Record<string, string> = {
-  mts1: "#3B82F6",
-  mts2: "#8B7CE8",
-  smp: "#3EC8C4",
-  sma: "#2FA36B",
-  smk: "#E08A2B",
-};
+// Palet warna kantin (mengikuti K_COLORS mockup). Kantin di luar daftar
+// (sekolah baru dari /setting) mendapat warna deterministik via hash kode,
+// jadi tidak perlu hardcode 7 sekolah di sini.
+const CANTEEN_PALETTE = [
+  "#3B82F6",
+  "#8B7CE8",
+  "#3EC8C4",
+  "#2FA36B",
+  "#E08A2B",
+  "#E5615A",
+  "#1AA0C4",
+  "#B39DDB",
+];
+
+/** Warna deterministik per kode kantin (hash sederhana → indeks palet). */
+function canteenColor(code: string): string {
+  let h = 0;
+  for (let i = 0; i < code.length; i++) h = (h * 31 + code.charCodeAt(i)) | 0;
+  return CANTEEN_PALETTE[Math.abs(h) % CANTEEN_PALETTE.length]!;
+}
 
 // Palet donut biaya (mengikuti urutan warna mockup + upah per orang).
 const EXPENSE_COLORS: Record<string, string> = {
@@ -24,15 +37,6 @@ const EXPENSE_COLORS: Record<string, string> = {
   transport: "#E08A2B",
   spp_ayah: "#E5615A",
   lainnya: "#94A3B8",
-};
-
-const LOC_LABEL: Record<string, string> = {
-  rumah: "Rumah",
-  mts1: "MTS1",
-  mts2: "MTS2",
-  smp: "SMP",
-  sma: "SMA",
-  smk: "SMK",
 };
 
 const CAT_LABEL: Record<string, string> = {
@@ -98,8 +102,14 @@ export function OmzetArea({ data }: { data: { date: string; total: number }[] })
   );
 }
 
-/** Bar per kantin — CSS murni, sama seperti sebelumnya. */
-export function KantinBars({ data }: { data: { canteen: string; total: number }[] }) {
+/** Bar per kantin — CSS murni. Label kantin dinamis dari location_ref. */
+export function KantinBars({
+  data,
+  labels,
+}: {
+  data: { canteen: string; total: number }[];
+  labels: Record<string, string>;
+}) {
   if (data.length === 0) {
     return <p className="empty">Belum ada penjualan per kantin.</p>;
   }
@@ -108,13 +118,13 @@ export function KantinBars({ data }: { data: { canteen: string; total: number }[
     <div className="bars">
       {data.map((d) => (
         <div className="bar-row" key={d.canteen}>
-          <span className="nm">{LOC_LABEL[d.canteen] ?? d.canteen}</span>
+          <span className="nm">{labelOf(d.canteen, labels)}</span>
           <div className="track">
             <div
               className="fill"
               style={{
                 width: `${(d.total / max) * 100}%`,
-                background: CANTEEN_COLORS[d.canteen] ?? "#3B82F6",
+                background: canteenColor(d.canteen),
               }}
             />
           </div>
