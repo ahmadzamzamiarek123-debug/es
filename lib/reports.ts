@@ -1,27 +1,31 @@
 // Query laporan untuk web (read-only, role web_reader).
-//
-// Semua query BERPARAMETER lewat tagged-template neon (aman dari injection).
-// TIDAK ada string-concat SQL. Tidak memanggil Gemini — web murni baca DB.
-//
-// Rumus (PROJECT.md §2):
-//   Laba usaha  = Omzet − (Pengeluaran + Upah produksi)
-//   Kas tersisa = Saldo awal + Laba usaha − Pengambilan
-// Saldo awal = baseline modal (kas + nilai bahan awal), sekali isi via /setting.
-// Pengambilan (owner draw, mis. SPP via MTS2) TIDAK mengurangi laba usaha,
-// hanya mengurangi kas tersisa.
-
 import { getSqlWeb } from "./db";
+import { getHppSummary } from "./hpp";
+import { getMonthlyFixedCost } from "./fixed-costs";
 
 export interface Summary {
-  omzet: number; // total penjualan
-  pengeluaran: number; // cash_out kind='pengeluaran'
-  upah: number; // total upah produksi (Zummy + Aril)
-  upahZummy: number; // production.wage_zummy_rp
-  upahAril: number; // production.wage_aril_rp
-  pengambilan: number; // cash_out kind='pengambilan'
-  saldoAwal: number; // opening_balance.saldo_awal_rp (baseline modal)
-  labaUsaha: number; // omzet - (pengeluaran + upah)
+  omzet: number; // total penjualan (revenue)
+  totalBahan: number; // estimasi biaya bahan baku terpakai
+  upahProduksi: number; // total upah produksi
+  biayaVariabel: number; // totalBahan + upahProduksi
+  labaKotor: number; // omzet - biayaVariabel
+  marginKotorPercent: number; // (labaKotor / omzet) * 100
+  biayaTetap: number; // monthly_fixed_cost
+  pengeluaranOperasionalLain: number; // cash_out kind='pengeluaran' kategori non-bahan
+  labaBersih: number; // labaKotor - biayaTetap - pengeluaranOperasionalLain
+  marginBersihPercent: number; // (labaBersih / omzet) * 100
+
+  // Metrik Transisi & Kas
+  labaUsaha: number; // versi lama: omzet - (pengeluaranKas + upahProduksi)
+  pengeluaran: number; // total cash_out kind='pengeluaran'
+  pengambilan: number; // total cash_out kind='pengambilan' (owner draw)
+  saldoAwal: number; // opening_balance.saldo_awal_rp
   kasTersisa: number; // saldoAwal + labaUsaha - pengambilan
+  
+  // Info Produksi & HPP
+  hppPerPcs: number;
+  totalRecipes: number;
+  totalPiecesProduced: number;
 }
 
 const toInt = (v: unknown): number => {
@@ -29,11 +33,6 @@ const toInt = (v: unknown): number => {
   return Number.isFinite(n) ? n : 0;
 };
 
-/**
- * Peta kode→label semua lokasi (dinamis dari location_ref). Dipakai halaman
- * web untuk menampilkan nama kantin/gudang tanpa hardcode. Role web_reader:
- * hanya SELECT. Fallback label = kode di-UPPERCASE bila belum ada di peta.
- */
 export async function getLocationLabels(): Promise<Record<string, string>> {
   const sql = getSqlWeb();
   const rows = (await sql`
@@ -44,47 +43,86 @@ export async function getLocationLabels(): Promise<Record<string, string>> {
   return map;
 }
 
-/** Label tampilan sebuah kode lokasi (fallback: kode di-UPPERCASE). */
 export function labelOf(code: string, labels: Record<string, string>): string {
   return labels[code] ?? code.toUpperCase();
 }
 
 /**
  * Ringkasan angka untuk rentang tanggal [start, end] inklusif.
- * start & end berupa 'YYYY-MM-DD'.
- *
- * CATATAN saldo awal: baseline modal adalah nilai SATU-KALI (titik nol), jadi
- * TIDAK difilter tanggal — selalu diikutkan penuh ke kas tersisa.
  */
 export async function getSummary(start: string, end: string): Promise<Summary> {
   const sql = getSqlWeb();
-  const rows = (await sql`
-    SELECT
-      (SELECT COALESCE(SUM(total_rp),0) FROM sale
-        WHERE sale_date BETWEEN ${start} AND ${end})                       AS omzet,
-      (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
-        WHERE kind='pengeluaran' AND out_date BETWEEN ${start} AND ${end}) AS pengeluaran,
-      (SELECT COALESCE(SUM(wage_zummy_rp),0) FROM production
-        WHERE prod_date BETWEEN ${start} AND ${end})                       AS upah_zummy,
-      (SELECT COALESCE(SUM(wage_aril_rp),0) FROM production
-        WHERE prod_date BETWEEN ${start} AND ${end})                       AS upah_aril,
-      (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
-        WHERE kind='pengambilan' AND out_date BETWEEN ${start} AND ${end}) AS pengambilan,
-      (SELECT COALESCE(saldo_awal_rp,0) FROM opening_balance WHERE id=1)    AS saldo_awal
-  `) as Record<string, unknown>[];
+  const monthStr = start.slice(0, 7); // 'YYYY-MM'
 
-  const r = rows[0] ?? {};
+  const [dbRows, hpp, fixedCost] = await Promise.all([
+    sql`
+      SELECT
+        (SELECT COALESCE(SUM(total_rp),0) FROM sale
+          WHERE sale_date BETWEEN ${start} AND ${end})                       AS omzet,
+        (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
+          WHERE kind='pengeluaran' AND out_date BETWEEN ${start} AND ${end}) AS pengeluaran,
+        (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
+          WHERE kind='pengeluaran' AND category <> 'bahan'
+            AND out_date BETWEEN ${start} AND ${end})                       AS pengeluaran_non_bahan,
+        (SELECT COALESCE(SUM(wage_rp),0) FROM production
+          WHERE prod_date BETWEEN ${start} AND ${end})                       AS upah_produksi,
+        (SELECT COALESCE(SUM(recipes),0) FROM production
+          WHERE prod_date BETWEEN ${start} AND ${end})                       AS total_recipes,
+        (SELECT COALESCE(SUM(output_pieces),0) FROM production
+          WHERE prod_date BETWEEN ${start} AND ${end})                       AS total_pieces,
+        (SELECT COALESCE(SUM(amount_rp),0) FROM cash_out
+          WHERE kind='pengambilan' AND out_date BETWEEN ${start} AND ${end}) AS pengambilan,
+        (SELECT COALESCE(saldo_awal_rp,0) FROM opening_balance WHERE id=1)    AS saldo_awal
+    ` as Promise<Record<string, unknown>[]>,
+    getHppSummary(sql),
+    getMonthlyFixedCost(sql, monthStr),
+  ]);
+
+  const r = dbRows[0] ?? {};
   const omzet = toInt(r.omzet);
   const pengeluaran = toInt(r.pengeluaran);
-  const upahZummy = toInt(r.upah_zummy);
-  const upahAril = toInt(r.upah_aril);
-  const upah = upahZummy + upahAril;
+  const pengeluaranOperasionalLain = toInt(r.pengeluaran_non_bahan);
+  const upahProduksi = toInt(r.upah_produksi);
+  const totalRecipes = toInt(r.total_recipes);
+  const totalPiecesProduced = toInt(r.total_pieces);
   const pengambilan = toInt(r.pengambilan);
   const saldoAwal = toInt(r.saldo_awal);
-  const labaUsaha = omzet - (pengeluaran + upah);
+
+  // Kalkulasi HPP & Biaya Variabel
+  const totalBahan = totalRecipes * hpp.totalBahanPerRecipeRp;
+  const biayaVariabel = totalBahan + upahProduksi;
+  const labaKotor = omzet - biayaVariabel;
+  const marginKotorPercent = omzet > 0 ? Math.round((labaKotor / omzet) * 1000) / 10 : 0;
+
+  // Biaya Tetap & Laba Bersih
+  const biayaTetap = fixedCost;
+  const labaBersih = labaKotor - biayaTetap - pengeluaranOperasionalLain;
+  const marginBersihPercent = omzet > 0 ? Math.round((labaBersih / omzet) * 1000) / 10 : 0;
+
+  // Metrik Transisi & Kas
+  const labaUsaha = omzet - (pengeluaran + upahProduksi);
   const kasTersisa = saldoAwal + labaUsaha - pengambilan;
 
-  return { omzet, pengeluaran, upah, upahZummy, upahAril, pengambilan, saldoAwal, labaUsaha, kasTersisa };
+  return {
+    omzet,
+    totalBahan,
+    upahProduksi,
+    biayaVariabel,
+    labaKotor,
+    marginKotorPercent,
+    biayaTetap,
+    pengeluaranOperasionalLain,
+    labaBersih,
+    marginBersihPercent,
+    labaUsaha,
+    pengeluaran,
+    pengambilan,
+    saldoAwal,
+    kasTersisa,
+    hppPerPcs: hpp.hppPerPcsRp,
+    totalRecipes,
+    totalPiecesProduced,
+  };
 }
 
 export interface DailyOmzet {
@@ -92,7 +130,6 @@ export interface DailyOmzet {
   total: number;
 }
 
-/** Omzet harian dalam rentang (untuk grafik garis). */
 export async function getDailyOmzet(
   start: string,
   end: string,
@@ -113,7 +150,6 @@ export interface CanteenSales {
   total: number;
 }
 
-/** Penjualan per kantin (untuk grafik batang). */
 export async function getSalesByCanteen(
   start: string,
   end: string,
@@ -138,37 +174,47 @@ export interface ExpenseSlice {
 }
 
 /**
- * Komposisi biaya untuk donut: pengeluaran per kategori + upah per orang
- * (Zummy & Aril terpisah — kadang produksi tidak dikerjakan berdua).
- * Pengambilan TIDAK dimasukkan (owner draw, bukan biaya usaha).
+ * Komposisi biaya: pengeluaran kas operasional + rincian upah per pekerja.
  */
 export async function getExpenseComposition(
   start: string,
   end: string,
 ): Promise<ExpenseSlice[]> {
   const sql = getSqlWeb();
-  const expRows = (await sql`
-    SELECT category::text AS category, COALESCE(SUM(amount_rp),0) AS total
-    FROM cash_out
-    WHERE kind='pengeluaran' AND out_date BETWEEN ${start} AND ${end}
-    GROUP BY category
-    ORDER BY total DESC
-  `) as Record<string, unknown>[];
-  const wageRows = (await sql`
-    SELECT COALESCE(SUM(wage_zummy_rp),0) AS zummy,
-           COALESCE(SUM(wage_aril_rp),0)  AS aril
-    FROM production
-    WHERE prod_date BETWEEN ${start} AND ${end}
-  `) as Record<string, unknown>[];
+  const [expRows, wageWorkerRows] = await Promise.all([
+    sql`
+      SELECT category::text AS category, COALESCE(SUM(amount_rp),0) AS total
+      FROM cash_out
+      WHERE kind='pengeluaran' AND out_date BETWEEN ${start} AND ${end}
+      GROUP BY category
+      ORDER BY total DESC
+    ` as Promise<Record<string, unknown>[]>,
+    sql`
+      SELECT w.name AS worker_name, COALESCE(SUM(pw.wage_rp),0) AS total_wage
+      FROM production_worker pw
+      JOIN worker w ON w.id = pw.worker_id
+      JOIN production p ON p.id = pw.production_id
+      WHERE p.prod_date BETWEEN ${start} AND ${end}
+      GROUP BY w.name
+      ORDER BY total_wage DESC
+    ` as Promise<Record<string, unknown>[]>,
+  ]);
 
   const slices: ExpenseSlice[] = expRows.map((r) => ({
     category: String(r.category),
     total: toInt(r.total),
   }));
-  const upahZummy = toInt(wageRows[0]?.zummy);
-  const upahAril = toInt(wageRows[0]?.aril);
-  if (upahZummy > 0) slices.push({ category: "upah Zummy", total: upahZummy });
-  if (upahAril > 0) slices.push({ category: "upah Aril", total: upahAril });
+
+  for (const wr of wageWorkerRows) {
+    const total = toInt(wr.total_wage);
+    if (total > 0) {
+      slices.push({
+        category: `Upah ${String(wr.worker_name)}`,
+        total,
+      });
+    }
+  }
+
   return slices.sort((a, b) => b.total - a.total);
 }
 
@@ -178,21 +224,16 @@ export interface TxRow {
   date: string;
   title: string;
   detail: string;
-  amount: number | null; // null untuk mutasi/produksi (tak ada nilai kas)
+  amount: number | null;
   direction: "in" | "out" | "neutral";
 }
 
-/**
- * Transaksi gabungan terbaru dari 5 tabel (untuk daftar & halaman transaksi).
- * Memakai UNION ALL berparameter; limit dibatasi.
- */
 export async function getRecentTransactions(
   start: string,
   end: string,
   limit = 100,
 ): Promise<TxRow[]> {
   const sql = getSqlWeb();
-  // Ambil per tabel lalu gabung di aplikasi — lebih mudah dibaca & tetap aman.
   const [sales, movements, cashIns, cashOuts, prods, labels] = await Promise.all([
     sql`SELECT id, sale_date::text AS d, canteen::text AS canteen, qty, total_rp
         FROM sale WHERE sale_date BETWEEN ${start} AND ${end}
@@ -214,7 +255,7 @@ export async function getRecentTransactions(
         ORDER BY out_date DESC, id DESC LIMIT ${limit}` as Promise<
       Record<string, unknown>[]
     >,
-    sql`SELECT id, prod_date::text AS d, recipes, output_pieces, wage_rp
+    sql`SELECT id, prod_date::text AS d, recipes, pieces_per_recipe, output_pieces, wage_rp
         FROM production WHERE prod_date BETWEEN ${start} AND ${end}
         ORDER BY prod_date DESC, id DESC LIMIT ${limit}` as Promise<
       Record<string, unknown>[]
@@ -264,7 +305,7 @@ export async function getRecentTransactions(
       id: toInt(r.id),
       kind: "cash_out",
       date: String(r.d),
-      title: isDraw ? `Pengambilan (${r.category})` : `Beli ${r.category}`,
+      title: isDraw ? `Pengambilan (${r.category})` : `Beli/Biaya (${r.category})`,
       detail: isDraw ? "owner draw" : "pengeluaran",
       amount: toInt(r.amount_rp),
       direction: "out",
@@ -276,13 +317,12 @@ export async function getRecentTransactions(
       kind: "production",
       date: String(r.d),
       title: "Produksi",
-      detail: `${toInt(r.recipes)} resep · ${toInt(r.output_pieces)} biji`,
+      detail: `${toInt(r.recipes)} resep (${toInt(r.output_pieces)} pcs @${toInt(r.pieces_per_recipe)})`,
       amount: null,
       direction: "neutral",
     });
   }
 
-  // Urutkan gabungan by tanggal desc lalu id desc.
   tx.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.id - a.id));
   return tx.slice(0, limit);
 }
@@ -294,17 +334,11 @@ export interface CheckItem {
   selisih: number;
 }
 
-/**
- * View "Perlu dicek": per kantin, bandingkan omzet penjualan vs kas masuk pada
- * rentang. Selisih besar (uang belum diterima / lebih) ditandai untuk ditinjau.
- * Ini bukan error — SMA/SMK memang wajar telat bayar — hanya bantu audit.
- */
 export async function getNeedsCheck(
   start: string,
   end: string,
 ): Promise<CheckItem[]> {
   const sql = getSqlWeb();
-  // Daftar kantin diambil dari location_ref (dinamis), bukan enum hardcode.
   const rows = (await sql`
     SELECT c.code AS canteen,
            COALESCE(s.omzet,0)   AS omzet,
@@ -327,12 +361,10 @@ export async function getNeedsCheck(
   });
 }
 
-// ===== Halaman Stok =====
-
 export interface StockRow {
   loc: string;
-  masuk: number; // produksi (rumah) + mutasi masuk
-  keluar: number; // mutasi keluar
+  masuk: number;
+  keluar: number;
   terjual: number;
   sisa: number;
 }
@@ -340,16 +372,11 @@ export interface StockRow {
 export interface StockReport {
   prodToday: { recipes: number; pieces: number };
   prodYesterday: { recipes: number; pieces: number };
-  keluarToday: number; // total mutasi keluar dari rumah hari ini
-  stocks: StockRow[]; // rumah + kantin non-batch (SMA/SMK tidak dilacak)
-  batch50: string[]; // kode kantin batch-50 (stok fisik tak dilacak)
+  keluarToday: number;
+  stocks: StockRow[];
+  batch50: string[];
 }
 
-/**
- * Data halaman /stok. Stok fisik = masuk − keluar − terjual per lokasi,
- * dihitung SEPANJANG WAKTU (bukan per periode). SMA & SMK batch-50 tidak
- * disertakan (stok fisik memang tidak dilacak — lihat CLAUDE.md §3).
- */
 export async function getStockReport(
   today: string,
   yesterday: string,
@@ -370,8 +397,6 @@ export async function getStockReport(
       WHERE from_loc IN (SELECT code FROM location_ref WHERE is_warehouse = true)
         AND move_date = ${today}
     ` as Promise<Record<string, unknown>[]>,
-    // Lokasi yang stok fisiknya dilacak = gudang + kantin NON-batch50 (aktif).
-    // SMA/SMK (batch50) sengaja dikecualikan (stok fisik tak dilacak).
     sql`
       WITH locs AS (
         SELECT code AS loc, is_warehouse
@@ -389,7 +414,6 @@ export async function getStockReport(
       FROM locs l
       ORDER BY l.is_warehouse DESC, l.loc
     ` as Promise<Record<string, unknown>[]>,
-    // Kantin batch-50 aktif (stok fisik tak dilacak) → hanya untuk badge info.
     sql`
       SELECT code FROM location_ref
       WHERE active = true AND is_batch50 = true

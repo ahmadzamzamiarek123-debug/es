@@ -1,10 +1,4 @@
-// Dashboard (server component). Gerbang auth sebenarnya ada di sini
-// (checkToken); middleware hanya redirect kalau cookie kosong.
-//
-// Query DB terjadi di server via lib/reports (role web_reader). Angka dihitung
-// pakai rumus PROJECT.md: laba usaha = omzet − (pengeluaran + upah);
-// kas tersisa = laba usaha − pengambilan.
-
+// Dashboard (server component).
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { checkToken, AUTH_COOKIE } from "@/lib/auth";
@@ -44,7 +38,6 @@ export default async function DashboardPage({
 }: {
   searchParams: Promise<{ p?: string }>;
 }) {
-  // Gerbang auth.
   const jar = await cookies();
   if (!checkToken(jar.get(AUTH_COOKIE)?.value)) redirect("/login");
 
@@ -52,7 +45,6 @@ export default async function DashboardPage({
   const period = parsePeriod(p);
   const { start, end } = periodRange(period);
 
-  // Ambil semua data paralel (read-only).
   const [summary, daily, byCanteen, expenses, needsCheck, recent, labels] =
     await Promise.all([
       getSummary(start, end),
@@ -64,7 +56,6 @@ export default async function DashboardPage({
       getLocationLabels(),
     ]);
 
-  // Kantin dengan selisih omzet vs kas masuk signifikan → tampilkan alert.
   const flagged = needsCheck.filter((c) => c.selisih > 0 && c.omzet > 0);
 
   return (
@@ -81,7 +72,7 @@ export default async function DashboardPage({
         <p className="kas-label">Kas tersisa · {PERIOD_LABEL[period]}</p>
         <p className="kas-val">{rp(summary.kasTersisa)}</p>
         <span className="kas-sub">
-          💵 Laba usaha {rp(summary.labaUsaha)}
+          ✨ Laba bersih {rp(summary.labaBersih)} ({summary.marginBersihPercent}%) · HPP {rp(summary.hppPerPcs)}/pcs
         </span>
       </header>
 
@@ -104,13 +95,13 @@ export default async function DashboardPage({
           </div>
           <div className="stat">
             <div className="ic b-green">📈</div>
-            <p className="t">Laba usaha</p>
-            <p className="v">{rp(summary.labaUsaha)}</p>
+            <p className="t">Laba Bersih</p>
+            <p className="v">{rp(summary.labaBersih)}</p>
           </div>
           <div className="stat">
-            <div className="ic b-orange">🧾</div>
-            <p className="t">Pengeluaran + upah</p>
-            <p className="v">{rp(summary.pengeluaran + summary.upah)}</p>
+            <div className="ic b-orange">🧊</div>
+            <p className="t">Laba Kotor</p>
+            <p className="v">{rp(summary.labaKotor)}</p>
           </div>
           <div className="stat">
             <div className="ic b-grape">🏦</div>
@@ -154,8 +145,8 @@ export default async function DashboardPage({
 
         {/* KOMPOSISI BIAYA */}
         <div className="card">
-          <p className="ct">Komposisi biaya</p>
-          <p className="cs">Pengeluaran + upah produksi</p>
+          <p className="ct">Komposisi biaya operasional & upah</p>
+          <p className="cs">Rincian beban biaya</p>
           <ExpenseDonut data={expenses} />
         </div>
 

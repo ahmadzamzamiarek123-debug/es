@@ -1,6 +1,4 @@
 // Export laporan bulanan sebagai CSV. Read-only (web_reader) + butuh cookie auth.
-// Angka = integer rupiah. Tidak mengeluarkan detail DB/stack.
-
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { checkToken, AUTH_COOKIE } from "@/lib/auth";
@@ -17,10 +15,6 @@ function parseMonth(input: string | null): string {
   return currentMonthJakarta();
 }
 
-/**
- * Escape sel CSV. Selain quoting biasa, cegah CSV injection: sel yang diawali
- * = + - @ diberi prefix kutip tunggal agar tak dieksekusi Excel/Sheets.
- */
 function csvCell(value: string | number): string {
   let s = String(value);
   if (/^[=+\-@]/.test(s)) s = `'${s}`;
@@ -40,17 +34,22 @@ export async function GET(req: Request) {
   const s = await getSummary(start, end);
 
   const lines = [
-    ["Laporan Es Lilin", month],
-    ["Komponen", "Rupiah"],
-    ["Omzet", s.omzet],
-    ["Pengeluaran usaha", s.pengeluaran],
-    ["Upah Zummy", s.upahZummy],
-    ["Upah Aril", s.upahAril],
-    ["Upah produksi (total)", s.upah],
-    ["Laba usaha", s.labaUsaha],
-    ["Saldo awal (modal)", s.saldoAwal],
-    ["Pengambilan", s.pengambilan],
-    ["Kas tersisa", s.kasTersisa],
+    ["Laporan Finansial Es Lilin", month],
+    ["Komponen", "Nilai / Rupiah", "Keterangan"],
+    ["Omzet Penjualan", s.omzet, "Total revenue"],
+    ["Total Resep Diproduksi", s.totalRecipes, "Resep"],
+    ["Total Biji Es Diproduksi", s.totalPiecesProduced, "Pcs"],
+    ["Biaya Bahan Baku Terpakai", s.totalBahan, "HPP bahan"],
+    ["Upah Produksi", s.upahProduksi, "Upah variabel pekerja"],
+    ["Laba Kotor", s.labaKotor, `Margin Kotor ${s.marginKotorPercent}%`],
+    ["Biaya Tetap (Listrik + Gas)", s.biayaTetap, "Flat bulanan"],
+    ["Biaya Operasional Lain", s.pengeluaranOperasionalLain, "Transport dll"],
+    ["Laba Bersih", s.labaBersih, `Margin Bersih ${s.marginBersihPercent}%`],
+    ["Laba Usaha (Transisi Lama)", s.labaUsaha, "Omzet - cashout - upah"],
+    ["Saldo Awal Modal", s.saldoAwal, "Baseline modal"],
+    ["Pengambilan (Owner Draw / SPP)", s.pengambilan, "Penarikan kas pribadi"],
+    ["Kas Tersisa", s.kasTersisa, "Posisi kas akhir"],
+    ["HPP per Pcs Standar", s.hppPerPcs, "Rp per biji"],
   ];
   const csv = lines.map((row) => row.map(csvCell).join(",")).join("\r\n");
 
@@ -58,7 +57,7 @@ export async function GET(req: Request) {
     status: 200,
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="laporan-${month}.csv"`,
+      "Content-Disposition": `attachment; filename="laporan-lengkap-${month}.csv"`,
     },
   });
 }

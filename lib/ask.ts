@@ -1,28 +1,21 @@
 /**
- * Jalur TANYA (baca) untuk bot: "cek stok", "kemarin mts1 kirim berapa",
- * "ringkasan hari ini", "transaksi terakhir".
- *
- * Keamanan: pertanyaan diubah jadi INTENT terstruktur oleh regex (tanpa AI
- * untuk pola umum). SQL selalu tagged-template berparameter — teks user tidak
- * pernah disambung ke SQL. Gemini TIDAK dipakai di jalur ini sama sekali:
- * pertanyaan di luar pola dijawab dengan bantuan format yang didukung.
- *
- * Daftar lokasi & label kini DINAMIS (LocationCtx dari lib/locations.ts).
+ * Jalur TANYA (baca) untuk bot: "cek stok", "cek hpp", "cek pekerja", "cek biaya tetap",
+ * "kemarin mts1 kirim berapa", "ringkasan hari ini", "transaksi terakhir".
  */
 import { getSqlBot } from "./db";
-import { todayJakarta, daysAgoJakarta } from "./dates";
+import { todayJakarta, daysAgoJakarta, currentMonthJakarta } from "./dates";
 import { rp } from "./format";
 import type { LocationCtx } from "./locations";
+import { getHppSummary } from "./hpp";
+import { getWorkers } from "./workers";
+import { getMonthlyFixedCost } from "./fixed-costs";
 
-/** Label tampilan sebuah kode lokasi (fallback: kode di-UPPERCASE). */
 function labelOf(code: string, labels: Record<string, string>): string {
   return labels[code] ?? code.toUpperCase();
 }
 
-/** Temukan lokasi yang disebut dalam teks lewat alias ctx ("mts 1" → mts1). */
 function findLocation(text: string, ctx: LocationCtx): string | null {
   const t = text.toLowerCase();
-  // Cek alias terpanjang dulu agar "mts 1" menang atas potongan pendek.
   const aliases = [...ctx.aliasMap.keys()].sort((a, b) => b.length - a.length);
   for (const alias of aliases) {
     const esc = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -33,7 +26,6 @@ function findLocation(text: string, ctx: LocationCtx): string | null {
   return null;
 }
 
-/** Tanggal yang dimaksud pertanyaan (default hari ini). */
 function findDate(text: string): { date: string; label: string } {
   const t = text.toLowerCase();
   if (/kemarin\s+lusa|lusa\s+kemarin/.test(t)) return { date: daysAgoJakarta(2), label: "kemarin lusa" };
@@ -43,11 +35,49 @@ function findDate(text: string): { date: string; label: string } {
   return { date: todayJakarta(), label: "hari ini" };
 }
 
-/**
- * Stok fisik per lokasi = masuk (produksi utk gudang + mutasi masuk)
- * − mutasi keluar − terjual. Kantin batch-50: stok fisik tidak dilacak.
- * Daftar lokasi yang dilacak diambil dari location_ref (gudang + non-batch50).
- */
+/** Laporan HPP dinamis */
+export async function hppReport(): Promise<string> {
+  const sql = getSqlBot();
+  const hpp = await getHppSummary(sql, true);
+
+  const ingLines = hpp.ingredients.map(
+    (i) => `• ${i.name}: ${i.qtyPerRecipe}${i.unit} × Rp${i.pricePerUnitRp}/${i.unit} = ${rp(i.costPerRecipeRp)}`,
+  );
+
+  return (
+    `🧊 *Rincian HPP Es Lilin:*\n\n` +
+    `*Biaya Bahan per 1 Resep:*\n` +
+    `${ingLines.join("\n")}\n` +
+    `👉 *Total Bahan/resep:* ${rp(hpp.totalBahanPerRecipeRp)}\n` +
+    `👉 *Upah Produksi/resep:* ${rp(hpp.upahProduksiPerRecipeRp)}\n` +
+    `👉 *Total HPP/resep:* ${rp(hpp.totalHppPerRecipeRp)}\n\n` +
+    `🎯 *Yield:* ${hpp.piecesPerRecipe} pcs/resep\n` +
+    `💰 *HPP per pcs:* *${rp(hpp.hppPerPcsRp)}* (Bahan saja: ${rp(hpp.hppBahanOnlyPerPcsRp)}/pcs)`
+  );
+}
+
+/** Laporan daftar pekerja */
+export async function workersReport(): Promise<string> {
+  const sql = getSqlBot();
+  const list = await getWorkers(sql, true);
+
+  const lines = list.map((w) => {
+    const statusNote = w.status === "rencana_belum_final" ? " _(rencana/belum final)_" : "";
+    return `• *${w.name}* [${w.role}] — ${rp(w.rateRp)} / ${w.rateType.replace("per_", "")}${statusNote}`;
+  });
+
+  return `👥 *Daftar Karyawan / Pekerja:*\n${lines.join("\n")}`;
+}
+
+/** Laporan biaya tetap */
+export async function fixedCostReport(): Promise<string> {
+  const sql = getSqlBot();
+  const month = currentMonthJakarta();
+  const cost = await getMonthlyFixedCost(sql, month);
+
+  return `💡 *Biaya Tetap Bulan Ini (${month}):*\n• Total: *${rp(cost)}* (listrik freezer + gas)`;
+}
+
 export async function stockReport(ctx: LocationCtx, labels: Record<string, string>): Promise<string> {
   const sql = getSqlBot();
   const rows = (await sql`
@@ -71,7 +101,6 @@ export async function stockReport(ctx: LocationCtx, labels: Record<string, strin
     const stock = r.produced + r.moved_in - r.moved_out - r.sold;
     return `• ${labelOf(r.loc, labels)}: ${stock} biji`;
   });
-  // Catatan batch-50 dinamis (kantin yang stoknya tidak dilacak).
   const b50 = [...ctx.batch50Set].map((c) => labelOf(c, labels));
   if (b50.length) {
     lines.push(`• ${b50.join(" & ")}: batch 50 — stok fisik tidak dilacak`);
@@ -79,7 +108,6 @@ export async function stockReport(ctx: LocationCtx, labels: Record<string, strin
   return `📦 Stok saat ini:\n${lines.join("\n")}`;
 }
 
-/** Ringkasan satu hari: produksi, kiriman, penjualan, kas masuk/keluar. */
 export async function dayReport(date: string, label: string): Promise<string> {
   const sql = getSqlBot();
   const rows = (await sql`
@@ -107,7 +135,6 @@ export async function dayReport(date: string, label: string): Promise<string> {
   );
 }
 
-/** "kemarin mts1 kirim berapa" → total mutasi MASUK ke lokasi pada tanggal. */
 export async function movementReport(
   loc: string,
   date: string,
@@ -115,7 +142,6 @@ export async function movementReport(
   labels: Record<string, string>,
 ): Promise<string> {
   const sql = getSqlBot();
-  // from_loc/to_loc kini text (FK ke location_ref) — tanpa cast ::location.
   const rows = (await sql`
     SELECT
       COALESCE(SUM(CASE WHEN to_loc = ${loc} THEN qty END), 0)::int AS masuk,
@@ -129,7 +155,6 @@ export async function movementReport(
   return `🔁 Mutasi ${name} ${label} (${date}):\n• Masuk: ${masuk} biji\n• Keluar: ${keluar} biji`;
 }
 
-/** "mts1 jual berapa hari ini" → penjualan per kantin per tanggal. */
 export async function saleReport(
   loc: string,
   date: string,
@@ -146,13 +171,12 @@ export async function saleReport(
   return `💵 Penjualan ${name} ${label} (${date}): ${r?.qty ?? 0} biji — ${rp(r?.total ?? 0)}`;
 }
 
-/** Transaksi terakhir lintas tabel, dengan ID (untuk perintah ubah/hapus). */
 export async function recentReport(limit = 8): Promise<string> {
   const sql = getSqlBot();
   const rows = (await sql`
     SELECT * FROM (
       SELECT 'produksi' AS jenis, id::int, prod_date::text AS tgl,
-             recipes || ' resep (' || worker || ')' AS info, created_at
+             recipes || ' resep (' || output_pieces || ' pcs @' || pieces_per_recipe || ')' AS info, created_at
         FROM production
       UNION ALL
       SELECT 'mutasi', id::int, move_date::text,
@@ -186,16 +210,14 @@ export async function recentReport(limit = 8): Promise<string> {
 const HELP_TEXT =
   "Aku bisa jawab:\n" +
   "• `cek stok`\n" +
+  "• `cek hpp`\n" +
+  "• `cek gaji` / `cek pekerja`\n" +
+  "• `cek biaya tetap`\n" +
   "• `ringkasan hari ini` / `ringkasan kemarin`\n" +
   "• `kemarin mts1 kirim berapa`\n" +
   "• `mts1 jual berapa hari ini`\n" +
   "• `transaksi terakhir` (tampil id untuk ralat)";
 
-/**
- * Router pertanyaan → jawaban. Pola tak dikenal → daftar bantuan (tanpa AI:
- * jalur baca sengaja deterministik agar aman & hemat kuota).
- * `ctx` + `labels` = daftar lokasi & label dinamis dari location_ref.
- */
 export async function answerQuestion(
   text: string,
   ctx: LocationCtx,
@@ -205,6 +227,9 @@ export async function answerQuestion(
   const { date, label } = findDate(t);
   const loc = findLocation(t, ctx);
 
+  if (/\bhpp\b/.test(t)) return hppReport();
+  if (/\b(pekerja|karyawan|gaji|rate)\b/.test(t) && !/\bgaji\s+ayah\s+\d+/.test(t)) return workersReport();
+  if (/\bbiaya\s+tetap\b/.test(t)) return fixedCostReport();
   if (/\bstok\b/.test(t) && !loc) return stockReport(ctx, labels);
   if (/transaksi terakhir|riwayat/.test(t)) return recentReport();
   if (/ringkasan|laporan|total/.test(t) && !loc) return dayReport(date, label);

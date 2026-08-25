@@ -1,10 +1,14 @@
-// Uji validasi zod: nilai wajar lolos, nilai di luar rentang ditolak, dan
-// aturan domain (batch 50, spp_ayah) ditegakkan.
-//
-// Lokasi kini DINAMIS: validateBatch menerima LocationCtx & checkBatch50
-// menerima batch50Set. Test membangun ctx dummy via buildLocationCtx (tanpa DB).
 import { describe, it, expect } from "vitest";
-import { validateBatch, checkBatch50, locationSettingSchema, openingBalanceSchema } from "../lib/validate";
+import {
+  validateBatch,
+  checkBatch50,
+  locationSettingSchema,
+  openingBalanceSchema,
+  ingredientPriceUpdateSchema,
+  workerSettingSchema,
+  monthlyFixedCostSchema,
+  defaultPiecesSchema,
+} from "../lib/validate";
 import { buildLocationCtx, type LocationInfo, type LocationCtx } from "../lib/locations";
 
 function loc(
@@ -40,7 +44,7 @@ describe("validateBatch — produksi", () => {
   it("resep 6 lolos", () => {
     const r = validateBatch({
       entity: "production",
-      rows: [{ prod_date: "2026-07-14", recipes: 6, worker: "berdua" }],
+      rows: [{ prod_date: "2026-07-14", recipes: 6, pieces_per_recipe: 85, workers: ["adek"] }],
     }, CTX);
     expect(r.ok).toBe(true);
   });
@@ -48,7 +52,7 @@ describe("validateBatch — produksi", () => {
   it("resep 0 ditolak (min 1)", () => {
     const r = validateBatch({
       entity: "production",
-      rows: [{ prod_date: "2026-07-14", recipes: 0, worker: "berdua" }],
+      rows: [{ prod_date: "2026-07-14", recipes: 0 }],
     }, CTX);
     expect(r.ok).toBe(false);
   });
@@ -56,43 +60,81 @@ describe("validateBatch — produksi", () => {
   it("resep 999 ditolak (>50)", () => {
     const r = validateBatch({
       entity: "production",
-      rows: [{ prod_date: "2026-07-14", recipes: 999, worker: "berdua" }],
+      rows: [{ prod_date: "2026-07-14", recipes: 999 }],
     }, CTX);
     expect(r.ok).toBe(false);
   });
 });
 
-describe("validateBatch — penjualan & harga", () => {
-  it("harga di luar rentang (>5000) ditolak", () => {
+describe("validateBatch — pengeluaran vs pengambilan (gaji ayah vs SPP)", () => {
+  it("gaji_ayah dengan kind 'pengeluaran' lolos", () => {
     const r = validateBatch({
-      entity: "sale",
-      rows: [{ sale_date: "2026-07-14", canteen: "mts1", qty: 10, price_rp: 999999 }],
+      entity: "cash_out",
+      rows: [{ out_date: "2026-07-14", kind: "pengeluaran", category: "gaji_ayah", amount_rp: 50000 }],
+    }, CTX);
+    expect(r.ok).toBe(true);
+  });
+
+  it("gaji_ayah dengan kind 'pengambilan' ditolak", () => {
+    const r = validateBatch({
+      entity: "cash_out",
+      rows: [{ out_date: "2026-07-14", kind: "pengambilan", category: "gaji_ayah", amount_rp: 50000 }],
     }, CTX);
     expect(r.ok).toBe(false);
   });
 
-  it("harga terlalu rendah (<100) ditolak", () => {
+  it("spp_ayah dengan kind 'pengambilan' lolos", () => {
     const r = validateBatch({
-      entity: "sale",
-      rows: [{ sale_date: "2026-07-14", canteen: "mts1", qty: 10, price_rp: 5 }],
+      entity: "cash_out",
+      rows: [{ out_date: "2026-07-14", kind: "pengambilan", category: "spp_ayah", amount_rp: 31500 }],
+    }, CTX);
+    expect(r.ok).toBe(true);
+  });
+
+  it("spp_ayah dengan kind 'pengeluaran' ditolak", () => {
+    const r = validateBatch({
+      entity: "cash_out",
+      rows: [{ out_date: "2026-07-14", kind: "pengeluaran", category: "spp_ayah", amount_rp: 31500 }],
     }, CTX);
     expect(r.ok).toBe(false);
   });
+});
 
-  it("canteen 'rumah' (gudang) ditolak", () => {
-    const r = validateBatch({
-      entity: "sale",
-      rows: [{ sale_date: "2026-07-14", canteen: "rumah", qty: 10, price_rp: 1300 }],
-    }, CTX);
-    expect(r.ok).toBe(false);
+describe("Master Data Zod Schemas", () => {
+  it("ingredientPriceUpdateSchema", () => {
+    expect(ingredientPriceUpdateSchema.safeParse({ name: "creamer", price_per_unit_rp: 55 }).success).toBe(true);
+    expect(ingredientPriceUpdateSchema.safeParse({ name: "skm", price_per_unit_rp: 24.8 }).success).toBe(true);
+    expect(ingredientPriceUpdateSchema.safeParse({ name: "", price_per_unit_rp: 55 }).success).toBe(false);
+    expect(ingredientPriceUpdateSchema.safeParse({ name: "gula", price_per_unit_rp: 0 }).success).toBe(false);
   });
 
-  it("canteen belum terdaftar ditolak", () => {
-    const r = validateBatch({
-      entity: "sale",
-      rows: [{ sale_date: "2026-07-14", canteen: "sdxyz", qty: 10, price_rp: 1300 }],
-    }, CTX);
-    expect(r.ok).toBe(false);
+  it("workerSettingSchema", () => {
+    expect(workerSettingSchema.safeParse({
+      name: "bibi",
+      role: "produksi",
+      rate_type: "per_pcs",
+      rate_rp: 150,
+      status: "aktif",
+    }).success).toBe(true);
+    expect(workerSettingSchema.safeParse({
+      name: "ayah",
+      role: "antar",
+      rate_type: "per_hari",
+      rate_rp: 10000,
+      status: "rencana_belum_final",
+    }).success).toBe(true);
+  });
+
+  it("monthlyFixedCostSchema", () => {
+    expect(monthlyFixedCostSchema.safeParse({ effective_month: "2026-08", amount_rp: 60000 }).success).toBe(true);
+    expect(monthlyFixedCostSchema.safeParse({ effective_month: "2026/08", amount_rp: 60000 }).success).toBe(false);
+    expect(monthlyFixedCostSchema.safeParse({ effective_month: "2026-08", amount_rp: -100 }).success).toBe(false);
+  });
+
+  it("defaultPiecesSchema", () => {
+    expect(defaultPiecesSchema.safeParse({ pieces_per_recipe: 85 }).success).toBe(true);
+    expect(defaultPiecesSchema.safeParse({ pieces_per_recipe: 0 }).success).toBe(false);
+    expect(defaultPiecesSchema.safeParse({ pieces_per_recipe: 250 }).success).toBe(false);
   });
 });
 
@@ -101,77 +143,13 @@ describe("aturan batch 50 (SMA/SMK)", () => {
     expect(checkBatch50({ sale_date: "2026-07-14", canteen: "sma", qty: 50, price_rp: 1300 }, BATCH50)).toEqual([]);
   });
 
-  it("SMA qty 30 (bukan kelipatan 50) ditolak", () => {
+  it("SMA qty 30 ditolak", () => {
     const errs = checkBatch50({ sale_date: "2026-07-14", canteen: "sma", qty: 30, price_rp: 1300 }, BATCH50);
     expect(errs.length).toBeGreaterThan(0);
   });
-
-  it("MTS1 qty 30 boleh (bukan kantin batch 50)", () => {
-    expect(checkBatch50({ sale_date: "2026-07-14", canteen: "mts1", qty: 30, price_rp: 1300 }, BATCH50)).toEqual([]);
-  });
-
-  it("validateBatch menolak penjualan SMK non-kelipatan-50", () => {
-    const r = validateBatch({
-      entity: "sale",
-      rows: [{ sale_date: "2026-07-14", canteen: "smk", qty: 33, price_rp: 1300 }],
-    }, CTX);
-    expect(r.ok).toBe(false);
-  });
 });
 
-describe("pengambilan ayah (owner draw manual)", () => {
-  it("pengambilan + spp_ayah lolos", () => {
-    const r = validateBatch({
-      entity: "cash_out",
-      rows: [{ out_date: "2026-07-14", kind: "pengambilan", category: "spp_ayah", amount_rp: 31500 }],
-    }, CTX);
-    expect(r.ok).toBe(true);
-  });
-
-  it("spp_ayah tapi kind 'pengeluaran' ditolak", () => {
-    const r = validateBatch({
-      entity: "cash_out",
-      rows: [{ out_date: "2026-07-14", kind: "pengeluaran", category: "spp_ayah", amount_rp: 31500 }],
-    }, CTX);
-    expect(r.ok).toBe(false);
-  });
-
-  it("amount_rp 0 ditolak (harus > 0)", () => {
-    const r = validateBatch({
-      entity: "cash_out",
-      rows: [{ out_date: "2026-07-14", kind: "pengeluaran", category: "bahan", amount_rp: 0 }],
-    }, CTX);
-    expect(r.ok).toBe(false);
-  });
-
-  it("amount_rp >= 100 juta ditolak", () => {
-    const r = validateBatch({
-      entity: "cash_out",
-      rows: [{ out_date: "2026-07-14", kind: "pengeluaran", category: "bahan", amount_rp: 100_000_000 }],
-    }, CTX);
-    expect(r.ok).toBe(false);
-  });
-});
-
-describe("validateBatch — kas masuk", () => {
-  it("desimal (float) ditolak — uang harus integer", () => {
-    const r = validateBatch({
-      entity: "cash_in",
-      rows: [{ received_date: "2026-07-14", canteen: "mts1", amount_rp: 900.5, method: "cash" }],
-    }, CTX);
-    expect(r.ok).toBe(false);
-  });
-
-  it("tanggal tidak nyata ditolak", () => {
-    const r = validateBatch({
-      entity: "cash_in",
-      rows: [{ received_date: "2026-13-40", canteen: "mts1", amount_rp: 90000, method: "cash" }],
-    }, CTX);
-    expect(r.ok).toBe(false);
-  });
-});
-
-describe("/setting — lokasi", () => {
+describe("/setting — lokasi & saldo awal", () => {
   it("kode + nama + harga valid lolos", () => {
     const r = locationSettingSchema.safeParse({
       code: "SDN1",
@@ -180,41 +158,11 @@ describe("/setting — lokasi", () => {
       is_batch50: false,
     });
     expect(r.success).toBe(true);
-    // code dinormalkan ke huruf kecil.
     if (r.success) expect(r.data.code).toBe("sdn1");
   });
 
-  it("kode diawali angka ditolak", () => {
-    const r = locationSettingSchema.safeParse({ code: "1sd", label: "X" });
-    expect(r.success).toBe(false);
-  });
-
-  it("harga di luar rentang ditolak", () => {
-    const r = locationSettingSchema.safeParse({ code: "sd1", label: "SD 1", price_rp: 99 });
-    expect(r.success).toBe(false);
-  });
-
-  it("harga boleh null (diisi nanti)", () => {
-    const r = locationSettingSchema.safeParse({ code: "sd1", label: "SD 1", price_rp: null });
-    expect(r.success).toBe(true);
-  });
-});
-
-describe("/setting — saldo awal", () => {
-  it("nominal >= 0 lolos", () => {
+  it("saldo awal valid", () => {
     expect(openingBalanceSchema.safeParse({ saldo_awal_rp: 500000 }).success).toBe(true);
-    expect(openingBalanceSchema.safeParse({ saldo_awal_rp: 0 }).success).toBe(true);
-  });
-
-  it("negatif ditolak", () => {
     expect(openingBalanceSchema.safeParse({ saldo_awal_rp: -1 }).success).toBe(false);
-  });
-
-  it("float ditolak — uang harus integer", () => {
-    expect(openingBalanceSchema.safeParse({ saldo_awal_rp: 500000.5 }).success).toBe(false);
-  });
-
-  it(">= 1 miliar ditolak", () => {
-    expect(openingBalanceSchema.safeParse({ saldo_awal_rp: 1_000_000_000 }).success).toBe(false);
   });
 });

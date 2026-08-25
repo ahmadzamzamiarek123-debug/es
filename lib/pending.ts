@@ -1,14 +1,5 @@
 /**
  * Pending confirm — state konfirmasi bot yang aman untuk serverless.
- *
- * Alur: pesan → parse → validasi → simpan batch ke pending_confirm dengan id
- * pendek acak → tombol ✅ Simpan hanya membawa id (jauh di bawah batas 64 byte
- * callback_data Telegram). Saat ditekan: ambil payload → VALIDASI ULANG zod
- * (defense in depth; payload dianggap tak tepercaya walau kita yang menulis)
- * → insert → hapus pending.
- *
- * Entri kedaluwarsa (>24 jam) dibersihkan oportunistik tiap kali menyimpan
- * pending baru — tanpa cron, cocok untuk serverless.
  */
 import { randomBytes } from 'crypto';
 import { eq, lt, sql } from 'drizzle-orm';
@@ -18,25 +9,30 @@ import {
   validateBatches,
   locationSettingSchema,
   openingBalanceSchema,
+  ingredientPriceUpdateSchema,
+  workerSettingSchema,
+  monthlyFixedCostSchema,
+  defaultPiecesSchema,
   type ParsedBatch,
   type LocationSetting,
   type OpeningBalanceInput,
+  type IngredientPriceUpdateInput,
+  type WorkerSettingInput,
+  type MonthlyFixedCostInput,
+  type DefaultPiecesInput,
 } from './validate';
 import type { LocationCtx } from './locations';
 
-/** Buat id pendek acak (12 hex char cukup; bukan kriptografi kunci). */
 function newId(): string {
   return randomBytes(6).toString('hex');
 }
 
-/** Bersihkan entri kedaluwarsa (>24 jam) — murah & tanpa cron. */
 async function purgeExpired(db: ReturnType<typeof getDbBot>): Promise<void> {
   await db
     .delete(pendingConfirm)
     .where(lt(pendingConfirm.createdAt, sql`now() - interval '24 hours'`));
 }
 
-/** Simpan daftar batch tervalidasi; kembalikan id untuk callback_data. */
 export async function savePending(batches: ParsedBatch[]): Promise<string> {
   const db = getDbBot();
   const id = newId();
@@ -49,11 +45,6 @@ export type PendingResult =
   | { ok: true; batches: ParsedBatch[] }
   | { ok: false; reason: 'notfound' | 'invalid' };
 
-/**
- * Ambil + hapus pending (sekali pakai). Payload divalidasi ulang penuh —
- * bila tak lolos (mis. data korup), dianggap invalid dan tidak disimpan.
- * `ctx` = daftar lokasi/kantin terbaru (validasi ulang keanggotaan lokasi).
- */
 export async function takePending(
   id: string,
   ctx: LocationCtx,
@@ -75,21 +66,22 @@ export async function takePending(
   return { ok: true, batches: result.batches };
 }
 
-/** Hapus pending tanpa memakai (tombol ❌ Batal). */
 export async function discardPending(id: string): Promise<void> {
   const db = getDbBot();
   await db.delete(pendingConfirm).where(eq(pendingConfirm.id, id));
 }
 
-// ===== Pending khusus /setting (lokasi & saldo awal) =====
-// Disimpan di tabel yang sama tapi payload berupa OBJEK bertag (bukan array),
-// jadi tidak bentrok dengan pending transaksi. Divalidasi ulang zod saat dipakai.
+// ===== Pending khusus /setting dan Master Data =====
 
-type SettingPayload =
+export type SettingPayload =
   | { kind: 'location'; data: unknown }
-  | { kind: 'opening_balance'; data: unknown };
+  | { kind: 'opening_balance'; data: unknown }
+  | { kind: 'ingredient_price'; data: unknown }
+  | { kind: 'worker_setting'; data: unknown }
+  | { kind: 'worker_status'; data: { name: string; status: 'aktif' | 'rencana_belum_final' } }
+  | { kind: 'monthly_fixed_cost'; data: unknown }
+  | { kind: 'default_pieces'; data: unknown };
 
-/** Simpan konfirmasi setting; kembalikan id pendek untuk callback_data. */
 export async function saveSettingPending(payload: SettingPayload): Promise<string> {
   const db = getDbBot();
   const id = newId();
@@ -101,9 +93,13 @@ export async function saveSettingPending(payload: SettingPayload): Promise<strin
 export type SettingPendingResult =
   | { ok: true; kind: 'location'; data: LocationSetting }
   | { ok: true; kind: 'opening_balance'; data: OpeningBalanceInput }
+  | { ok: true; kind: 'ingredient_price'; data: IngredientPriceUpdateInput }
+  | { ok: true; kind: 'worker_setting'; data: WorkerSettingInput }
+  | { ok: true; kind: 'worker_status'; data: { name: string; status: 'aktif' | 'rencana_belum_final' } }
+  | { ok: true; kind: 'monthly_fixed_cost'; data: MonthlyFixedCostInput }
+  | { ok: true; kind: 'default_pieces'; data: DefaultPiecesInput }
   | { ok: false; reason: 'notfound' | 'invalid' };
 
-/** Ambil + hapus konfirmasi setting; validasi ulang zod sesuai jenisnya. */
 export async function takeSettingPending(id: string): Promise<SettingPendingResult> {
   const db = getDbBot();
   const rows = await db
@@ -114,15 +110,50 @@ export async function takeSettingPending(id: string): Promise<SettingPendingResu
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { ok: false, reason: 'notfound' };
   }
+
   if (payload.kind === 'location') {
     const p = locationSettingSchema.safeParse(payload.data);
     if (!p.success) return { ok: false, reason: 'invalid' };
     return { ok: true, kind: 'location', data: p.data };
   }
+
   if (payload.kind === 'opening_balance') {
     const p = openingBalanceSchema.safeParse(payload.data);
     if (!p.success) return { ok: false, reason: 'invalid' };
     return { ok: true, kind: 'opening_balance', data: p.data };
   }
+
+  if (payload.kind === 'ingredient_price') {
+    const p = ingredientPriceUpdateSchema.safeParse(payload.data);
+    if (!p.success) return { ok: false, reason: 'invalid' };
+    return { ok: true, kind: 'ingredient_price', data: p.data };
+  }
+
+  if (payload.kind === 'worker_setting') {
+    const p = workerSettingSchema.safeParse(payload.data);
+    if (!p.success) return { ok: false, reason: 'invalid' };
+    return { ok: true, kind: 'worker_setting', data: p.data };
+  }
+
+  if (payload.kind === 'worker_status') {
+    const d = payload.data;
+    if (d && typeof d.name === 'string' && (d.status === 'aktif' || d.status === 'rencana_belum_final')) {
+      return { ok: true, kind: 'worker_status', data: d };
+    }
+    return { ok: false, reason: 'invalid' };
+  }
+
+  if (payload.kind === 'monthly_fixed_cost') {
+    const p = monthlyFixedCostSchema.safeParse(payload.data);
+    if (!p.success) return { ok: false, reason: 'invalid' };
+    return { ok: true, kind: 'monthly_fixed_cost', data: p.data };
+  }
+
+  if (payload.kind === 'default_pieces') {
+    const p = defaultPiecesSchema.safeParse(payload.data);
+    if (!p.success) return { ok: false, reason: 'invalid' };
+    return { ok: true, kind: 'default_pieces', data: p.data };
+  }
+
   return { ok: false, reason: 'invalid' };
 }

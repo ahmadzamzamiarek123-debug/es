@@ -24,6 +24,7 @@
 
 TRUNCATE
   production,
+  production_worker,
   stock_movement,
   sale,
   cash_in,

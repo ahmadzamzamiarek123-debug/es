@@ -1,11 +1,6 @@
-// Validasi zod untuk hasil parsing (regex maupun Gemini).
+// Validasi zod untuk hasil parsing (regex maupun Gemini) dan pengaturan data master.
 // Output AI = DATA TAK TERPERCAYA → semua wajib lolos schema ini sebelum insert.
-// Rentang wajar mengikuti CLAUDE.md §2 (batas contoh) — di luar itu ditolak,
-// bukan diperbaiki diam-diam.
-//
-// CATATAN: daftar lokasi kini DINAMIS (tabel location_ref, lihat lib/locations.ts).
-// zod hanya menjaga BENTUK (string tak kosong); keanggotaan lokasi/kantin dicek
-// terhadap `LocationCtx` yang di-inject pemanggil (bukan enum statis lagi).
+// Rentang wajar mengikuti batas yang logis — di luar itu ditolak, bukan diperbaiki diam-diam.
 
 import { z } from "zod";
 import type { LocationCtx } from "./locations";
@@ -19,17 +14,13 @@ export const EXPENSE_CATEGORIES = [
   "plastik",
   "transport",
   "spp_ayah",
+  "gaji_ayah",
   "lainnya",
 ] as const;
-
-// Siapa yang mengerjakan produksi. Upah Rp5.000/resep per orang yang ikut:
-// berdua → Zummy+Aril (10.000/resep), zummy/aril → hanya dia (5.000/resep).
-export const WORKERS = ["berdua", "zummy", "aril"] as const;
 
 export const paymentMethodEnum = z.enum(PAYMENT_METHODS);
 export const cashoutKindEnum = z.enum(CASHOUT_KINDS);
 export const expenseCategoryEnum = z.enum(EXPENSE_CATEGORIES);
-export const workerEnum = z.enum(WORKERS);
 
 // Lokasi/kantin: hanya bentuk (string tak kosong). Keanggotaan dicek via ctx.
 const locString = z.string().min(1, "lokasi belum jelas");
@@ -54,17 +45,24 @@ const isoDate = z
 // Catatan bebas opsional; batasi panjang agar tidak jadi vektor spam.
 const note = z.string().trim().max(280).optional();
 
-// Uang selalu integer rupiah (tanpa desimal/float). CLAUDE.md §0.3.
+// Uang selalu integer rupiah (tanpa desimal/float).
 const rupiahInt = z
   .number()
   .int("nominal harus bilangan bulat rupiah (tanpa desimal)");
 
 // ===== 1. Produksi =====
-// recipes 1–50 (CLAUDE.md). output_pieces & upah dihitung DB, jangan dikirim.
 export const productionSchema = z.object({
   prod_date: isoDate,
   recipes: z.number().int().min(1, "resep minimal 1").max(50, "resep maksimal 50"),
-  worker: workerEnum.default("berdua"),
+  // Yield per resep (opsional; default 85 jika tidak disebut)
+  pieces_per_recipe: z
+    .number()
+    .int()
+    .min(1, "pcs per resep minimal 1")
+    .max(200, "pcs per resep maksimal 200")
+    .optional(),
+  // Daftar nama pekerja yang ikut (misal ['adek', 'diri_sendiri'])
+  workers: z.array(z.string()).optional(),
   note,
 });
 
@@ -75,7 +73,10 @@ export const stockMovementSchema = z
     from_loc: locString,
     to_loc: locString,
     qty: z
-      .number({ invalid_type_error: "sebutkan jumlah biji yang dikirim (mis. kirim mts1 100)", required_error: "sebutkan jumlah biji yang dikirim (mis. kirim mts1 100)" })
+      .number({
+        invalid_type_error: "sebutkan jumlah biji yang dikirim (mis. kirim mts1 100)",
+        required_error: "sebutkan jumlah biji yang dikirim (mis. kirim mts1 100)",
+      })
       .int()
       .min(1, "qty minimal 1")
       .max(2000, "qty tak wajar (>2000)"),
@@ -87,18 +88,22 @@ export const stockMovementSchema = z
   });
 
 // ===== 3. Penjualan =====
-// price_rp 100–5000 (CLAUDE.md). qty 0–2000. Aturan batch 50 dicek terpisah
-// di bawah (lewat checkBatch50) agar pesan errornya jelas & bisa minta konfirmasi.
 export const saleSchema = z.object({
   sale_date: isoDate,
   canteen: locString,
   qty: z
-    .number({ invalid_type_error: "sebutkan jumlah biji yang terjual (mis. jual mts1 79)", required_error: "sebutkan jumlah biji yang terjual (mis. jual mts1 79)" })
+    .number({
+      invalid_type_error: "sebutkan jumlah biji yang terjual (mis. jual mts1 79)",
+      required_error: "sebutkan jumlah biji yang terjual (mis. jual mts1 79)",
+    })
     .int()
     .min(0, "qty tak boleh negatif")
     .max(2000, "qty tak wajar (>2000)"),
   price_rp: z
-    .number({ invalid_type_error: "harga per biji belum jelas (mis. jual mts1 79 @1300)", required_error: "harga per biji belum jelas (mis. jual mts1 79 @1300)" })
+    .number({
+      invalid_type_error: "harga per biji belum jelas (mis. jual mts1 79 @1300)",
+      required_error: "harga per biji belum jelas (mis. jual mts1 79 @1300)",
+    })
     .int()
     .min(100, "harga tak wajar (<100)")
     .max(5000, "harga tak wajar (>5000)"),
@@ -106,7 +111,6 @@ export const saleSchema = z.object({
 });
 
 // ===== 4. Kas masuk =====
-// amount_rp > 0 & < 100 juta (CLAUDE.md).
 export const cashInSchema = z.object({
   received_date: isoDate,
   canteen: locString,
@@ -128,16 +132,19 @@ export const cashOutSchema = z
       .refine((v) => v < 100_000_000, "jumlah tak wajar (>= 100 juta)"),
     note,
   })
-  // Uang MTS2 diambil ayah = kind 'pengambilan' + category 'spp_ayah'.
-  // Kategori spp_ayah hanya masuk akal untuk pengambilan, bukan pengeluaran usaha.
+  // Aturan domain: spp_ayah = pengambilan (owner draw), gaji_ayah = pengeluaran (biaya usaha)
   .refine((r) => !(r.category === "spp_ayah" && r.kind !== "pengambilan"), {
     message: "kategori spp_ayah harus berjenis 'pengambilan'",
     path: ["kind"],
+  })
+  .refine((r) => !(r.category === "gaji_ayah" && r.kind !== "pengeluaran"), {
+    message: "kategori gaji_ayah harus berjenis 'pengeluaran'",
+    path: ["kind"],
   });
 
-// ===== Schema untuk /setting (kelola lokasi & saldo awal) =====
+// ===== Schema untuk /setting dan Pengaturan Master Data =====
 
-// Kode lokasi: huruf kecil + angka, ringkas & aman jadi kunci (mis. 'mts1').
+// 1. Lokasi / Kantin
 export const locationSettingSchema = z.object({
   code: z
     .string()
@@ -145,7 +152,6 @@ export const locationSettingSchema = z.object({
     .toLowerCase()
     .regex(/^[a-z][a-z0-9_]{1,19}$/, "kode: huruf/angka, 2–20 karakter, diawali huruf"),
   label: z.string().trim().min(1, "nama tampilan wajib").max(40),
-  // Harga jual kita per biji (uang kita), 100–5000. Opsional (boleh diisi nanti).
   price_rp: z
     .number()
     .int()
@@ -157,7 +163,7 @@ export const locationSettingSchema = z.object({
 });
 export type LocationSetting = z.infer<typeof locationSettingSchema>;
 
-// Saldo awal (rupiah, integer, >= 0). Baseline modal (kas + nilai bahan awal).
+// 2. Saldo Awal (Modal)
 export const openingBalanceSchema = z.object({
   saldo_awal_rp: rupiahInt
     .refine((v) => v >= 0, "saldo awal tak boleh negatif")
@@ -166,7 +172,54 @@ export const openingBalanceSchema = z.object({
 });
 export type OpeningBalanceInput = z.infer<typeof openingBalanceSchema>;
 
-// ===== Tipe TS turunan (z.infer) =====
+// 3. Update Harga Bahan (per unit/satuan)
+export const ingredientPriceUpdateSchema = z.object({
+  name: z.string().trim().min(1, "nama bahan wajib"),
+  price_per_unit_rp: z
+    .number()
+    .min(0.0001, "harga harus lebih dari 0")
+    .max(1_000_000, "harga satuan terlalu tinggi"),
+  raw_text: z.string().optional(), // misal "55rb per kilo"
+});
+export type IngredientPriceUpdateInput = z.infer<typeof ingredientPriceUpdateSchema>;
+
+// 4. Pengaturan Karyawan / Worker
+export const workerSettingSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1, "nama pekerja wajib")
+    .max(30),
+  role: z.enum(["produksi", "antar"]).default("produksi"),
+  rate_type: z.enum(["per_resep", "per_pcs", "per_hari"]).default("per_resep"),
+  rate_rp: z.number().int().min(0, "rate gaji tidak boleh negatif"),
+  status: z.enum(["aktif", "rencana_belum_final"]).default("aktif"),
+});
+export type WorkerSettingInput = z.infer<typeof workerSettingSchema>;
+
+// 5. Pengaturan Biaya Tetap Bulanan
+export const monthlyFixedCostSchema = z.object({
+  effective_month: z
+    .string()
+    .regex(/^\d{4}-\d{2}$/, "format bulan harus YYYY-MM"),
+  amount_rp: rupiahInt
+    .refine((v) => v >= 0, "biaya tetap tidak boleh negatif")
+    .refine((v) => v < 50_000_000, "nominal biaya tetap terlalu besar"),
+  note: note,
+});
+export type MonthlyFixedCostInput = z.infer<typeof monthlyFixedCostSchema>;
+
+// 6. Pengaturan Default Pieces per Resep
+export const defaultPiecesSchema = z.object({
+  pieces_per_recipe: z
+    .number()
+    .int()
+    .min(1, "pcs per resep minimal 1")
+    .max(200, "pcs per resep maksimal 200"),
+});
+export type DefaultPiecesInput = z.infer<typeof defaultPiecesSchema>;
+
+// ===== Tipe TS turunan =====
 export type Production = z.infer<typeof productionSchema>;
 export type StockMovement = z.infer<typeof stockMovementSchema>;
 export type Sale = z.infer<typeof saleSchema>;
@@ -180,7 +233,6 @@ export type Entity =
   | "cash_in"
   | "cash_out";
 
-// Kontrak JSON hasil parse: selalu { entity, rows[] }.
 export type ParsedBatch =
   | { entity: "production"; rows: Production[] }
   | { entity: "stock_movement"; rows: StockMovement[] }
@@ -188,7 +240,6 @@ export type ParsedBatch =
   | { entity: "cash_in"; rows: CashIn[] }
   | { entity: "cash_out"; rows: CashOut[] };
 
-// Peta entity → schema baris, dipakai validasi generik.
 const ROW_SCHEMA = {
   production: productionSchema,
   stock_movement: stockMovementSchema,
@@ -201,11 +252,6 @@ export type ValidateResult =
   | { ok: true; batch: ParsedBatch }
   | { ok: false; errors: string[] };
 
-/**
- * Validasi tambahan khusus penjualan SMA/SMK: qty wajib kelipatan 50.
- * Dikembalikan sebagai daftar pesan (kosong = lolos) supaya bot bisa
- * minta konfirmasi ulang, bukan mengoreksi diam-diam.
- */
 export function checkBatch50(sale: Sale, batch50Set: Set<string>): string[] {
   const errors: string[] = [];
   if (batch50Set.has(sale.canteen) && sale.qty % 50 !== 0) {
@@ -216,7 +262,6 @@ export function checkBatch50(sale: Sale, batch50Set: Set<string>): string[] {
   return errors;
 }
 
-/** Pesan ramah saat sebuah kode lokasi tak dikenal / bukan kantin. */
 function unknownLocMsg(code: string, ctx: LocationCtx, mustBeCanteen: boolean): string {
   if (ctx.warehouseSet.has(code)) {
     return mustBeCanteen
@@ -229,12 +274,6 @@ function unknownLocMsg(code: string, ctx: LocationCtx, mustBeCanteen: boolean): 
   return `lokasi '${code}' belum terdaftar (tambahkan dulu lewat /setting)`;
 }
 
-/**
- * Validasi satu batch hasil parse. Menerima bentuk longgar (unknown),
- * mengembalikan batch bertipe kuat bila lolos, atau daftar error yang
- * ramah untuk ditampilkan ke chat (tanpa membocorkan detail internal).
- * `ctx` = daftar lokasi/kantin/batch50 aktif (dari lib/locations.ts).
- */
 export function validateBatch(
   input: { entity: unknown; rows: unknown },
   ctx: LocationCtx,
@@ -250,7 +289,6 @@ export function validateBatch(
   if (!Array.isArray(input.rows) || input.rows.length === 0) {
     return { ok: false, errors: ["tidak ada baris data untuk disimpan"] };
   }
-  // Batas jumlah baris per pesan agar tidak kebanjiran (mis. AI ngawur).
   if (input.rows.length > 50) {
     return { ok: false, errors: ["terlalu banyak baris dalam satu pesan (maks 50)"] };
   }
@@ -266,7 +304,6 @@ export function validateBatch(
       errors.push(`baris ${i + 1}: ${msgs.join(", ")}`);
       return;
     }
-    // Cek keanggotaan lokasi/kantin terhadap ctx (dinamis).
     if (entity === "stock_movement") {
       const m = res.data as StockMovement;
       if (!ctx.locationSet.has(m.from_loc)) {
@@ -301,8 +338,6 @@ export function validateBatch(
   });
 
   if (errors.length) return { ok: false, errors };
-
-  // Cast aman: tiap baris sudah lolos schema entity yang sesuai.
   return { ok: true, batch: { entity, rows: validRows } as ParsedBatch };
 }
 
@@ -310,11 +345,6 @@ export type ValidateManyResult =
   | { ok: true; batches: ParsedBatch[] }
   | { ok: false; errors: string[] };
 
-/**
- * Validasi BEBERAPA batch sekaligus (hasil pesan multi-operasi).
- * Semua-atau-tidak: satu operasi tak valid → seluruh pesan ditolak dengan
- * pesan per operasi, supaya user tidak setengah tersimpan tanpa sadar.
- */
 export function validateBatches(
   inputs: { entity: unknown; rows: unknown }[],
   ctx: LocationCtx,
@@ -322,7 +352,6 @@ export function validateBatches(
   if (inputs.length === 0) {
     return { ok: false, errors: ["tidak ada operasi yang dikenali"] };
   }
-  // Batas operasi per pesan agar konfirmasi tetap terbaca.
   if (inputs.length > 10) {
     return { ok: false, errors: ["terlalu banyak operasi dalam satu pesan (maks 10)"] };
   }

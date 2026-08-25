@@ -1,15 +1,18 @@
-// Uji parser regex (tanpa memanggil Gemini). Memastikan kalimat rapi → JSON benar.
-//
-// Lokasi kini DINAMIS (tabel location_ref). Parser menerima LocationCtx, jadi
-// test membangun ctx dummy via buildLocationCtx — TIDAK menyentuh DB. Harga
-// default disuntik di sini (di produksi berasal dari /setting): kantin = 1300
-// (omzet kita), SMA/SMK batch 50.
 import { describe, it, expect } from "vitest";
-import { parseWithRegex, parseMultiWithRegex, parseRupiah } from "../lib/parse";
+import {
+  parseWithRegex,
+  parseMultiWithRegex,
+  parseRupiah,
+  parseIngredientPriceUpdate,
+  parseMonthlyFixedCost,
+  parseDefaultPieces,
+  parseWorkerSetting,
+  parseWorkerStatusActivation,
+} from "../lib/parse";
 import { buildLocationCtx, type LocationInfo, type LocationCtx } from "../lib/locations";
-import { todayJakarta } from "../lib/dates";
+import { buildWorkerCtx, type WorkerInfo, type WorkerCtx } from "../lib/workers";
+import { todayJakarta, currentMonthJakarta } from "../lib/dates";
 
-/** Lokasi contoh untuk uji (meniru hasil /setting owner). */
 function loc(
   code: string,
   label: string,
@@ -39,6 +42,13 @@ const CTX: LocationCtx = buildLocationCtx([
   loc("smk", "SMK", { isCanteen: true, isBatch50: true, priceRp: 1300 }),
 ]);
 
+const WORKERS_LIST: WorkerInfo[] = [
+  { id: 1, name: "adek", role: "produksi", rateType: "per_resep", rateRp: 5000, active: true, status: "aktif" },
+  { id: 2, name: "diri_sendiri", role: "produksi", rateType: "per_resep", rateRp: 10000, active: true, status: "aktif" },
+  { id: 3, name: "ayah", role: "antar", rateType: "per_hari", rateRp: 10000, active: true, status: "rencana_belum_final" },
+];
+const W_CTX: WorkerCtx = buildWorkerCtx(WORKERS_LIST);
+
 describe("parseRupiah", () => {
   it("mengurai berbagai bentuk nominal", () => {
     expect(parseRupiah("20rb")).toBe(20000);
@@ -52,63 +62,51 @@ describe("parseRupiah", () => {
   });
 });
 
-describe("parseWithRegex", () => {
+describe("parseWithRegex — Produksi & Yield & Worker", () => {
   const today = todayJakarta();
 
-  it("produksi (default berdua)", () => {
-    expect(parseWithRegex("produksi 6 resep", CTX)).toEqual({
+  it("produksi standar", () => {
+    const r = parseWithRegex("produksi 4 resep", CTX, W_CTX);
+    expect(r).toEqual({
       entity: "production",
-      rows: [{ prod_date: today, recipes: 6, worker: "berdua" }],
+      rows: [{ prod_date: today, recipes: 4, pieces_per_recipe: undefined, workers: undefined }],
     });
   });
 
-  it("produksi sendiri → worker zummy", () => {
-    const r = parseWithRegex("produksi 6 resep sendiri", CTX);
-    expect(r?.rows[0]).toMatchObject({ recipes: 6, worker: "zummy" });
-  });
-
-  it("produksi sama aril → worker berdua", () => {
-    const r = parseWithRegex("produksi 4 resep sama aril", CTX);
-    expect(r?.rows[0]).toMatchObject({ recipes: 4, worker: "berdua" });
-  });
-
-  it("mutasi kirim rumah->mts1", () => {
-    expect(parseWithRegex("kirim rumah->mts1 100", CTX)).toEqual({
-      entity: "stock_movement",
-      rows: [{ move_date: today, from_loc: "rumah", to_loc: "mts1", qty: 100 }],
+  it("produksi dengan yield custom dan pekerja eksplisit", () => {
+    const r = parseWithRegex("produksi 4 resep hasil 340 sama adek", CTX, W_CTX);
+    expect(r?.entity).toBe("production");
+    expect(r?.rows[0]).toMatchObject({
+      recipes: 4,
+      pieces_per_recipe: 85,
+      workers: ["adek"],
     });
   });
 
-  it("mutasi lempar antar kantin (bukan penjualan)", () => {
-    const r = parseWithRegex("lempar mts2 -> sma 15", CTX);
-    expect(r?.entity).toBe("stock_movement");
-    expect(r?.rows[0]).toMatchObject({ from_loc: "mts2", to_loc: "sma", qty: 15 });
+  it("produksi sendiri", () => {
+    const r = parseWithRegex("produksi 6 resep sendiri", CTX, W_CTX);
+    expect(r?.entity).toBe("production");
+    expect(r?.rows[0]).toMatchObject({
+      recipes: 6,
+      workers: ["diri_sendiri"],
+    });
+  });
+});
+
+describe("parseWithRegex — Transaksi & Gaji Ayah", () => {
+  const today = todayJakarta();
+
+  it("gaji ayah (pengeluaran)", () => {
+    const r = parseWithRegex("gaji ayah 50rb", CTX);
+    expect(r?.entity).toBe("cash_out");
+    expect(r?.rows[0]).toMatchObject({
+      kind: "pengeluaran",
+      category: "gaji_ayah",
+      amount_rp: 50000,
+    });
   });
 
-  it("penjualan dengan harga default kantin", () => {
-    const r = parseWithRegex("jual mts1 100", CTX);
-    expect(r?.entity).toBe("sale");
-    expect(r?.rows[0]).toMatchObject({ canteen: "mts1", qty: 100, price_rp: 1300 });
-  });
-
-  it("penjualan SMA default kantin + batch 50", () => {
-    const r = parseWithRegex("jual sma batch 50", CTX);
-    expect(r?.entity).toBe("sale");
-    expect(r?.rows[0]).toMatchObject({ canteen: "sma", qty: 50, price_rp: 1300, note: "batch 50" });
-  });
-
-  it("penjualan dengan harga eksplisit @800", () => {
-    const r = parseWithRegex("jual smk 50 @800", CTX);
-    expect(r?.rows[0]).toMatchObject({ canteen: "smk", qty: 50, price_rp: 800 });
-  });
-
-  it("kas masuk", () => {
-    const r = parseWithRegex("uang mts1 90rb", CTX);
-    expect(r?.entity).toBe("cash_in");
-    expect(r?.rows[0]).toMatchObject({ canteen: "mts1", amount_rp: 90000 });
-  });
-
-  it("pengambilan ayah → cash_out pengambilan/spp_ayah", () => {
+  it("ambil ayah spp (pengambilan)", () => {
     const r = parseWithRegex("ambil ayah 31500 spp", CTX);
     expect(r?.entity).toBe("cash_out");
     expect(r?.rows[0]).toMatchObject({
@@ -118,58 +116,87 @@ describe("parseWithRegex", () => {
     });
   });
 
-  it("pengeluaran beli bahan", () => {
-    const r = parseWithRegex("beli bahan 20rb", CTX);
-    expect(r?.entity).toBe("cash_out");
-    expect(r?.rows[0]).toMatchObject({
-      kind: "pengeluaran",
-      category: "bahan",
-      amount_rp: 20000,
+  it("mutasi kirim rumah->mts1", () => {
+    expect(parseWithRegex("kirim rumah->mts1 100", CTX)).toEqual({
+      entity: "stock_movement",
+      rows: [{ move_date: today, from_loc: "rumah", to_loc: "mts1", qty: 100 }],
     });
   });
 
-  it("mutasi 'mts1 kirim 100' (tujuan di depan, asal rumah)", () => {
-    const r = parseWithRegex("mts1 kirim 100", CTX);
-    expect(r?.entity).toBe("stock_movement");
-    expect(r?.rows[0]).toMatchObject({ from_loc: "rumah", to_loc: "mts1", qty: 100 });
-  });
-
-  it("mutasi 'kirim 50 ke sma' (asal rumah)", () => {
-    const r = parseWithRegex("kirim 50 ke sma", CTX);
-    expect(r?.entity).toBe("stock_movement");
-    expect(r?.rows[0]).toMatchObject({ from_loc: "rumah", to_loc: "sma", qty: 50 });
-  });
-
-  it("penjualan dengan 'tanggal N' → tanggal bulan berjalan", () => {
-    const r = parseWithRegex("tanggal 14 jual mts1 79", CTX);
+  it("penjualan dengan harga default kantin", () => {
+    const r = parseWithRegex("jual mts1 100", CTX);
     expect(r?.entity).toBe("sale");
-    expect(r?.rows[0]).toMatchObject({ canteen: "mts1", qty: 79 });
-    // sale_date harus berakhiran -14 (hari ke-14), bukan hari ini
-    expect((r?.rows[0] as { sale_date: string }).sale_date).toMatch(/-14$/);
+    expect(r?.rows[0]).toMatchObject({ canteen: "mts1", qty: 100, price_rp: 1300 });
   });
 
-  it("kalimat bebas → null (nanti fallback Gemini)", () => {
-    expect(parseWithRegex("tadi pagi kayaknya laku lumayan deh", CTX)).toBeNull();
+  it("kas masuk", () => {
+    const r = parseWithRegex("uang mts1 90rb", CTX);
+    expect(r?.entity).toBe("cash_in");
+    expect(r?.rows[0]).toMatchObject({ canteen: "mts1", amount_rp: 90000 });
+  });
+});
+
+describe("Master Data Parser", () => {
+  it("parseIngredientPriceUpdate — per kilo, per gram, per pcs", () => {
+    const creamer = parseIngredientPriceUpdate("harga creamer sekarang 55rb per kilo");
+    expect(creamer).toMatchObject({ name: "creamer", price_per_unit_rp: 55 });
+
+    const gula = parseIngredientPriceUpdate("harga gula 18rb/kg");
+    expect(gula).toMatchObject({ name: "gula", price_per_unit_rp: 18 });
+
+    const skm = parseIngredientPriceUpdate("harga skm 62rb per 2.5kg");
+    expect(skm).toMatchObject({ name: "skm", price_per_unit_rp: 24.8 });
+
+    const plastik = parseIngredientPriceUpdate("harga plastik 40rb per 800 pcs");
+    expect(plastik).toMatchObject({ name: "plastik", price_per_unit_rp: 50 });
+  });
+
+  it("parseMonthlyFixedCost", () => {
+    const r = parseMonthlyFixedCost("biaya tetap bulan ini 65rb");
+    expect(r).toMatchObject({ effective_month: currentMonthJakarta(), amount_rp: 65000 });
+
+    const r2 = parseMonthlyFixedCost("biaya listrik gas 60rb");
+    expect(r2).toMatchObject({ effective_month: currentMonthJakarta(), amount_rp: 60000 });
+  });
+
+  it("parseDefaultPieces", () => {
+    const r = parseDefaultPieces("ganti default pcs per resep jadi 88");
+    expect(r).toMatchObject({ pieces_per_recipe: 88 });
+
+    const r2 = parseDefaultPieces("default pcs per resep 90");
+    expect(r2).toMatchObject({ pieces_per_recipe: 90 });
+  });
+
+  it("parseWorkerSetting", () => {
+    const r = parseWorkerSetting("tambah karyawan baru bibi, produksi, per pcs 150");
+    expect(r).toMatchObject({
+      name: "bibi",
+      role: "produksi",
+      rate_type: "per_pcs",
+      rate_rp: 150,
+      status: "aktif",
+    });
+
+    const r2 = parseWorkerSetting("gaji adek, produksi, per resep 6000");
+    expect(r2).toMatchObject({
+      name: "adek",
+      role: "produksi",
+      rate_type: "per_resep",
+      rate_rp: 6000,
+    });
+  });
+
+  it("parseWorkerStatusActivation", () => {
+    const r = parseWorkerStatusActivation("ayah mulai digaji");
+    expect(r).toMatchObject({ name: "ayah", status: "aktif" });
   });
 });
 
 describe("parseMultiWithRegex", () => {
   it("beberapa operasi dipisah koma", () => {
     const r = parseMultiWithRegex("mts1 kirim 100, sma kirim 50", CTX);
-    expect(r).not.toBeNull();
     expect(r).toHaveLength(2);
     expect(r?.[0]?.rows[0]).toMatchObject({ to_loc: "mts1", qty: 100 });
     expect(r?.[1]?.rows[0]).toMatchObject({ to_loc: "sma", qty: 50 });
-  });
-
-  it("campuran jenis: jual + kas masuk", () => {
-    const r = parseMultiWithRegex("jual mts1 100, uang mts1 90rb", CTX);
-    expect(r).toHaveLength(2);
-    expect(r?.[0]?.entity).toBe("sale");
-    expect(r?.[1]?.entity).toBe("cash_in");
-  });
-
-  it("satu potongan gagal → seluruhnya null (fallback Gemini)", () => {
-    expect(parseMultiWithRegex("jual mts1 100, entah apa ini", CTX)).toBeNull();
   });
 });

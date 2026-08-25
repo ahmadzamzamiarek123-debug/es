@@ -1,21 +1,14 @@
 /**
  * Lapisan INSERT — satu-satunya jalur tulis ke DB dari bot.
  *
- * Prinsip:
- *   - Semua insert lewat Drizzle (query berparameter) — tidak ada string-concat SQL.
- *   - Input WAJIB sudah divalidasi zod (lib/validate.ts) sebelum masuk sini.
- *   - Multi-baris SATU entity = satu statement INSERT (atomik). Multi-OPERASI
- *     (insertBatches) berurutan & TIDAK atomik antar operasi — driver Neon
- *     HTTP tak mendukung transaksi interaktif; hasil dilaporkan jujur N/N.
- *   - Memakai koneksi bot_writer (getDbBot). Web tidak pernah mengimpor modul ini.
- *
- * Nilai uang di sini SUDAH integer rupiah (dijamin oleh zod .int()). Tidak ada
- * float yang menyentuh DB.
+ * Semua insert lewat Drizzle (query berparameter) — tidak ada string-concat SQL.
+ * Memakai koneksi bot_writer (getDbBot).
  */
-import { desc, eq, sql } from 'drizzle-orm';
-import { getDbBot } from './db';
+import { desc, eq } from 'drizzle-orm';
+import { getDbBot, getSqlBot } from './db';
 import {
   production,
+  productionWorker,
   stockMovement,
   sale,
   cashIn,
@@ -28,35 +21,85 @@ import type {
   ParsedBatch,
   LocationSetting,
   OpeningBalanceInput,
+  IngredientPriceUpdateInput,
+  WorkerSettingInput,
+  MonthlyFixedCostInput,
+  DefaultPiecesInput,
 } from './validate';
 import { invalidateLocations } from './locations';
+import { getDefaultPiecesPerRecipe, setDefaultPiecesPerRecipe as setAppSettingDefaultPieces } from './settings';
+import { getWorkers, buildWorkerCtx, calculateWagesForProduction, upsertWorker as dbUpsertWorker, setWorkerStatus as dbSetWorkerStatus } from './workers';
+import { updateIngredientPrice as dbUpdateIngredientPrice } from './hpp';
+import { setMonthlyFixedCost as dbSetMonthlyFixedCost } from './fixed-costs';
 
-/** Hasil insert: entity + daftar id baris yang tersimpan (untuk balasan bot). */
 export interface InsertResult {
   entity: ParsedBatch['entity'];
   ids: number[];
 }
 
 /**
- * Simpan satu batch hasil parse+validasi. Mengembalikan id baris yang dibuat.
- * Kolom GENERATED (output_pieces, wage_rp, total_rp) dihitung DB, tidak dikirim.
+ * Simpan satu batch hasil parse+validasi.
  */
 export async function insertBatch(batch: ParsedBatch): Promise<InsertResult> {
   const db = getDbBot();
+  const sql = getSqlBot();
 
   switch (batch.entity) {
     case 'production': {
-      const rows = batch.rows.map((r) => ({
-        prodDate: r.prod_date,
-        recipes: r.recipes,
-        worker: r.worker,
-        note: r.note ?? null,
-      }));
-      const inserted = await db
-        .insert(production)
-        .values(rows)
-        .returning({ id: production.id });
-      return { entity: 'production', ids: inserted.map((x) => Number(x.id)) };
+      const defaultPieces = await getDefaultPiecesPerRecipe(sql);
+      const rawWorkers = await getWorkers(sql, true);
+      const wCtx = buildWorkerCtx(rawWorkers);
+
+      const insertedIds: number[] = [];
+
+      for (const r of batch.rows) {
+        const pieces = r.pieces_per_recipe ?? defaultPieces;
+        
+        // Tentukan worker yang mengerjakan
+        let assignedWorkers = wCtx.productionWorkers;
+        if (r.workers && r.workers.length > 0) {
+          const matched = r.workers
+            .map((wName) => wCtx.workerMap.get(wName.toLowerCase()))
+            .filter((w): w is typeof rawWorkers[0] => Boolean(w && w.active));
+          if (matched.length > 0) {
+            assignedWorkers = matched;
+          }
+        }
+
+        const { workerAllocations, totalWageRp } = calculateWagesForProduction(
+          assignedWorkers,
+          r.recipes,
+          pieces,
+        );
+
+        const inserted = await db
+          .insert(production)
+          .values({
+            prodDate: r.prod_date,
+            recipes: r.recipes,
+            piecesPerRecipe: pieces,
+            wageRp: totalWageRp,
+            note: r.note ?? null,
+          })
+          .returning({ id: production.id });
+
+        const prodId = Number(inserted[0]?.id);
+        insertedIds.push(prodId);
+
+        // Insert rincian alokasi worker ke production_worker
+        if (workerAllocations.length > 0) {
+          await db.insert(productionWorker).values(
+            workerAllocations.map((a) => ({
+              productionId: prodId,
+              workerId: a.workerId,
+              recipes: a.recipes,
+              wageRp: a.wageRp,
+            })),
+          );
+        }
+      }
+
+      return { entity: 'production', ids: insertedIds };
     }
 
     case 'stock_movement': {
@@ -121,20 +164,12 @@ export async function insertBatch(batch: ParsedBatch): Promise<InsertResult> {
   }
 }
 
-/** Hasil insert multi-batch: per operasi sukses/gagal (untuk laporan N/N). */
 export interface MultiInsertResult {
   results: (InsertResult | { entity: Entity; error: true })[];
   okCount: number;
   total: number;
 }
 
-/**
- * Simpan BEBERAPA batch berurutan.
- * CATATAN: driver Neon HTTP tidak mendukung transaksi interaktif lintas
- * statement, jadi ini BUKAN atomik antar operasi — operasi yang sudah masuk
- * tetap tersimpan bila operasi berikutnya gagal. Pemanggil wajib melaporkan
- * "okCount/total" dengan jujur ke user.
- */
 export async function insertBatches(
   batches: ParsedBatch[],
 ): Promise<MultiInsertResult> {
@@ -152,7 +187,7 @@ export async function insertBatches(
   return { results, okCount, total: batches.length };
 }
 
-// ===== Revisi (undo / hapus / ubah) — tetap hanya lewat bot =====
+// ===== Revisi (undo / hapus / ubah) =====
 
 const TABLE_BY_ENTITY = {
   production,
@@ -170,7 +205,6 @@ export const ENTITY_LABEL: Record<Entity, string> = {
   cash_out: 'kas keluar',
 };
 
-/** Satu baris transaksi generik untuk ditampilkan sebelum konfirmasi revisi. */
 export interface TxSnapshot {
   entity: Entity;
   id: number;
@@ -181,7 +215,6 @@ function fmtRp(n: number): string {
   return `Rp${n.toLocaleString('id-ID')}`;
 }
 
-/** Ambil ringkasan satu baris berdasarkan entity+id (null bila tak ada). */
 export async function getSnapshot(
   entity: Entity,
   id: number,
@@ -192,15 +225,17 @@ export async function getSnapshot(
       const r = (await db.select().from(production).where(eq(production.id, id)))[0];
       if (!r) return null;
       return {
-        entity, id,
-        summary: `produksi ${r.recipes} resep (${r.worker}) · ${r.prodDate}`,
+        entity,
+        id,
+        summary: `produksi ${r.recipes} resep (${r.outputPieces} pcs @${r.piecesPerRecipe}/resep, upah ${fmtRp(r.wageRp)}) · ${r.prodDate}`,
       };
     }
     case 'stock_movement': {
       const r = (await db.select().from(stockMovement).where(eq(stockMovement.id, id)))[0];
       if (!r) return null;
       return {
-        entity, id,
+        entity,
+        id,
         summary: `mutasi ${r.fromLoc}→${r.toLoc} ${r.qty} biji · ${r.moveDate}`,
       };
     }
@@ -208,33 +243,32 @@ export async function getSnapshot(
       const r = (await db.select().from(sale).where(eq(sale.id, id)))[0];
       if (!r) return null;
       return {
-        entity, id,
-        summary: `jual ${r.canteen} ${r.qty} × ${fmtRp(r.priceRp)} · ${r.saleDate}`,
+        entity,
+        id,
+        summary: `jual ${r.canteen} ${r.qty} × ${fmtRp(r.priceRp)} = ${fmtRp(r.totalRp ?? r.qty * r.priceRp)} · ${r.saleDate}`,
       };
     }
     case 'cash_in': {
       const r = (await db.select().from(cashIn).where(eq(cashIn.id, id)))[0];
       if (!r) return null;
       return {
-        entity, id,
-        summary: `kas masuk ${r.canteen} ${fmtRp(r.amountRp)} · ${r.receivedDate}`,
+        entity,
+        id,
+        summary: `kas masuk ${r.canteen} ${fmtRp(r.amountRp)} (${r.method}) · ${r.receivedDate}`,
       };
     }
     case 'cash_out': {
       const r = (await db.select().from(cashOut).where(eq(cashOut.id, id)))[0];
       if (!r) return null;
       return {
-        entity, id,
+        entity,
+        id,
         summary: `${r.kind} [${r.category}] ${fmtRp(r.amountRp)} · ${r.outDate}`,
       };
     }
   }
 }
 
-/**
- * Cari id di semua tabel (id unik per tabel, bukan global — jadi bila id yang
- * sama ada di dua tabel, kembalikan semuanya agar user memilih entitasnya).
- */
 export async function findById(id: number): Promise<TxSnapshot[]> {
   const entities: Entity[] = ['production', 'stock_movement', 'sale', 'cash_in', 'cash_out'];
   const found: TxSnapshot[] = [];
@@ -245,7 +279,6 @@ export async function findById(id: number): Promise<TxSnapshot[]> {
   return found;
 }
 
-/** Hapus satu baris. Mengembalikan true bila ada yang terhapus. */
 export async function deleteRow(entity: Entity, id: number): Promise<boolean> {
   const db = getDbBot();
   const table = TABLE_BY_ENTITY[entity];
@@ -253,34 +286,71 @@ export async function deleteRow(entity: Entity, id: number): Promise<boolean> {
   return deleted.length > 0;
 }
 
-/**
- * Insert TERAKHIR di seluruh tabel (berdasar created_at) — target perintah
- * `undo`. Mengembalikan snapshot untuk dikonfirmasi dulu, bukan langsung hapus.
- */
 export async function getLastInserted(): Promise<TxSnapshot | null> {
   const db = getDbBot();
   const candidates: { snap: TxSnapshot; at: Date }[] = [];
 
   const p = (await db.select().from(production).orderBy(desc(production.createdAt)).limit(1))[0];
-  if (p) candidates.push({ at: p.createdAt, snap: { entity: 'production', id: Number(p.id), summary: `produksi ${p.recipes} resep (${p.worker}) · ${p.prodDate}` } });
+  if (p) {
+    candidates.push({
+      at: p.createdAt,
+      snap: {
+        entity: 'production',
+        id: Number(p.id),
+        summary: `produksi ${p.recipes} resep (${p.outputPieces} pcs @${p.piecesPerRecipe}/resep) · ${p.prodDate}`,
+      },
+    });
+  }
   const m = (await db.select().from(stockMovement).orderBy(desc(stockMovement.createdAt)).limit(1))[0];
-  if (m) candidates.push({ at: m.createdAt, snap: { entity: 'stock_movement', id: Number(m.id), summary: `mutasi ${m.fromLoc}→${m.toLoc} ${m.qty} biji · ${m.moveDate}` } });
+  if (m) {
+    candidates.push({
+      at: m.createdAt,
+      snap: {
+        entity: 'stock_movement',
+        id: Number(m.id),
+        summary: `mutasi ${m.fromLoc}→${m.toLoc} ${m.qty} biji · ${m.moveDate}`,
+      },
+    });
+  }
   const s = (await db.select().from(sale).orderBy(desc(sale.createdAt)).limit(1))[0];
-  if (s) candidates.push({ at: s.createdAt, snap: { entity: 'sale', id: Number(s.id), summary: `jual ${s.canteen} ${s.qty} × ${fmtRp(s.priceRp)} · ${s.saleDate}` } });
+  if (s) {
+    candidates.push({
+      at: s.createdAt,
+      snap: {
+        entity: 'sale',
+        id: Number(s.id),
+        summary: `jual ${s.canteen} ${s.qty} × ${fmtRp(s.priceRp)} · ${s.saleDate}`,
+      },
+    });
+  }
   const ci = (await db.select().from(cashIn).orderBy(desc(cashIn.createdAt)).limit(1))[0];
-  if (ci) candidates.push({ at: ci.createdAt, snap: { entity: 'cash_in', id: Number(ci.id), summary: `kas masuk ${ci.canteen} ${fmtRp(ci.amountRp)} · ${ci.receivedDate}` } });
+  if (ci) {
+    candidates.push({
+      at: ci.createdAt,
+      snap: {
+        entity: 'cash_in',
+        id: Number(ci.id),
+        summary: `kas masuk ${ci.canteen} ${fmtRp(ci.amountRp)} · ${ci.receivedDate}`,
+      },
+    });
+  }
   const co = (await db.select().from(cashOut).orderBy(desc(cashOut.createdAt)).limit(1))[0];
-  if (co) candidates.push({ at: co.createdAt, snap: { entity: 'cash_out', id: Number(co.id), summary: `${co.kind} [${co.category}] ${fmtRp(co.amountRp)} · ${co.outDate}` } });
+  if (co) {
+    candidates.push({
+      at: co.createdAt,
+      snap: {
+        entity: 'cash_out',
+        id: Number(co.id),
+        summary: `${co.kind} [${co.category}] ${fmtRp(co.amountRp)} · ${co.outDate}`,
+      },
+    });
+  }
 
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => b.at.getTime() - a.at.getTime());
   return candidates[0]?.snap ?? null;
 }
 
-/**
- * Ubah nilai UTAMA satu baris (qty untuk mutasi/penjualan, recipes untuk
- * produksi, amount untuk kas). Perubahan kolom lain = hapus lalu input ulang.
- */
 export async function updateMainValue(
   entity: Entity,
   id: number,
@@ -311,14 +381,8 @@ export async function updateMainValue(
   }
 }
 
-// ===== /setting — kelola lokasi & saldo awal (hanya lewat bot) =====
+// ===== Pengaturan Master & Setting =====
 
-/**
- * Tambah / ubah satu lokasi (upsert by code). Dipakai owner via /setting untuk
- * mendaftarkan 7 sekolah + harga per kantin. Selalu is_canteen=true (yang
- * ditambah owner adalah kantin; gudang 'rumah' sudah diseed migrasi 0005).
- * Sesudah menulis → invalidasi cache lokasi agar parser/validator segar.
- */
 export async function upsertLocation(loc: LocationSetting): Promise<void> {
   const db = getDbBot();
   await db
@@ -343,7 +407,6 @@ export async function upsertLocation(loc: LocationSetting): Promise<void> {
   invalidateLocations();
 }
 
-/** Nonaktifkan sebuah lokasi (soft-delete: active=false). */
 export async function deactivateLocation(code: string): Promise<boolean> {
   const db = getDbBot();
   const r = await db
@@ -355,26 +418,45 @@ export async function deactivateLocation(code: string): Promise<boolean> {
   return r.length > 0;
 }
 
-/**
- * Set saldo awal (baris tunggal id=1). Upsert: sekali isi, boleh dikoreksi.
- * Baseline modal (kas + nilai bahan awal) untuk rumus kas di laporan.
- */
 export async function setOpeningBalance(inp: OpeningBalanceInput): Promise<void> {
-  const db = getDbBot();
-  await db
-    .insert(openingBalance)
-    .values({
-      id: 1,
-      saldoAwalRp: inp.saldo_awal_rp,
-      note: inp.note ?? null,
-      updatedAt: sql`now()`,
-    })
-    .onConflictDoUpdate({
-      target: openingBalance.id,
-      set: {
-        saldoAwalRp: inp.saldo_awal_rp,
-        note: inp.note ?? null,
-        updatedAt: sql`now()`,
-      },
-    });
+  const sql = getSqlBot();
+  await sql`
+    INSERT INTO opening_balance (id, saldo_awal_rp, note, updated_at)
+    VALUES (1, ${inp.saldo_awal_rp}, ${inp.note ?? null}, now())
+    ON CONFLICT (id) DO UPDATE
+      SET saldo_awal_rp = EXCLUDED.saldo_awal_rp,
+          note = EXCLUDED.note,
+          updated_at = now()
+  `;
+}
+
+export async function updateIngredientPriceAction(inp: IngredientPriceUpdateInput): Promise<boolean> {
+  const sql = getSqlBot();
+  return dbUpdateIngredientPrice(sql, inp.name, inp.price_per_unit_rp);
+}
+
+export async function upsertWorkerAction(inp: WorkerSettingInput): Promise<void> {
+  const sql = getSqlBot();
+  await dbUpsertWorker(sql, {
+    name: inp.name,
+    role: inp.role,
+    rateType: inp.rate_type,
+    rateRp: inp.rate_rp,
+    status: inp.status,
+  });
+}
+
+export async function setWorkerStatusAction(name: string, status: 'aktif' | 'rencana_belum_final'): Promise<boolean> {
+  const sql = getSqlBot();
+  return dbSetWorkerStatus(sql, name, status);
+}
+
+export async function setMonthlyFixedCostAction(inp: MonthlyFixedCostInput): Promise<void> {
+  const sql = getSqlBot();
+  await dbSetMonthlyFixedCost(sql, inp.effective_month, inp.amount_rp, inp.note);
+}
+
+export async function setDefaultPiecesAction(inp: DefaultPiecesInput): Promise<void> {
+  const sql = getSqlBot();
+  await setAppSettingDefaultPieces(sql, inp.pieces_per_recipe);
 }

@@ -1,7 +1,4 @@
 // Halaman Laporan bulanan (server component, read-only).
-// Tabel: omzet → biaya (pengeluaran + upah) → laba usaha → pengambilan →
-// kas tersisa, untuk bulan yang dipilih. Bisa export CSV.
-
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { checkToken, AUTH_COOKIE } from "@/lib/auth";
@@ -12,7 +9,6 @@ import { BottomNav } from "@/components/nav";
 
 export const dynamic = "force-dynamic";
 
-/** Validasi 'YYYY-MM'; kalau tak valid → bulan berjalan. */
 function parseMonth(input: string | undefined): string {
   if (input && /^\d{4}-\d{2}$/.test(input)) {
     const m = Number(input.slice(5, 7));
@@ -21,7 +17,6 @@ function parseMonth(input: string | undefined): string {
   return currentMonthJakarta();
 }
 
-/** Geser 'YYYY-MM' sebanyak delta bulan. */
 function shiftMonth(ym: string, delta: number): string {
   const [y, m] = ym.split("-").map(Number);
   const idx = (y as number) * 12 + (m as number) - 1 + delta;
@@ -57,23 +52,38 @@ export default async function LaporanPage({
   const next = shiftMonth(month, 1);
   const thisMonth = currentMonthJakarta();
 
-  // Baris laporan sesuai rumus PROJECT.md §2. Upah dipisah per orang
-  // (Zummy & Aril) karena produksi kadang tidak dikerjakan berdua.
-  const rows: { label: string; value: number; kind: "in" | "out" | "sum" | "draw" }[] = [
-    { label: "Omzet (total penjualan)", value: s.omzet, kind: "in" },
-    { label: "Pengeluaran usaha", value: -s.pengeluaran, kind: "out" },
-    { label: "Upah Zummy", value: -s.upahZummy, kind: "out" },
-    { label: "Upah Aril", value: -s.upahAril, kind: "out" },
-    { label: "Laba usaha", value: s.labaUsaha, kind: "sum" },
-    { label: "Saldo awal (modal)", value: s.saldoAwal, kind: "in" },
-    { label: "Pengambilan (owner draw)", value: -s.pengambilan, kind: "draw" },
-    { label: "Kas tersisa", value: s.kasTersisa, kind: "sum" },
+  const reportSections = [
+    {
+      title: "1. Pendapatan & Biaya Variabel (HPP)",
+      rows: [
+        { label: "Omzet Penjualan", value: s.omzet, kind: "in" },
+        { label: `Biaya Bahan Baku (${s.totalRecipes} resep / ${s.totalPiecesProduced} pcs)`, value: -s.totalBahan, kind: "out" },
+        { label: "Upah Produksi", value: -s.upahProduksi, kind: "out" },
+        { label: `Laba Kotor (Margin ${s.marginKotorPercent}%)`, value: s.labaKotor, kind: "sum" },
+      ],
+    },
+    {
+      title: "2. Biaya Tetap & Operasional",
+      rows: [
+        { label: "Biaya Tetap Bulanan (Listrik + Gas)", value: -s.biayaTetap, kind: "out" },
+        { label: "Biaya Operasional Non-Bahan (Transport dll)", value: -s.pengeluaranOperasionalLain, kind: "out" },
+        { label: `Laba Bersih (Margin ${s.marginBersihPercent}%)`, value: s.labaBersih, kind: "sum" },
+      ],
+    },
+    {
+      title: "3. Arus Kas & Saldo Modal",
+      rows: [
+        { label: "Saldo Awal (Modal Baseline)", value: s.saldoAwal, kind: "in" },
+        { label: "Pengambilan Pribadi (Owner Draw)", value: -s.pengambilan, kind: "draw" },
+        { label: "Kas Tersisa", value: s.kasTersisa, kind: "sum" },
+      ],
+    },
   ];
 
   return (
     <div className="app">
       <header className="page-hd">
-        <h1>Laporan bulanan</h1>
+        <h1>Laporan Keuangan & HPP</h1>
         <p>{monthLabel(month)}</p>
       </header>
 
@@ -92,49 +102,75 @@ export default async function LaporanPage({
           )}
         </div>
 
-        {/* Kartu kas tersisa */}
+        {/* Ringkasan Finansial Hero */}
         <div className="card report-hero">
-          <p className="cs">Kas tersisa {monthLabel(month)}</p>
-          <p className="report-kas">{rp(s.kasTersisa)}</p>
+          <p className="cs">Laba Bersih {monthLabel(month)}</p>
+          <p className="report-kas" style={{ color: s.labaBersih >= 0 ? "#2fa36b" : "#e5615a" }}>
+            {rp(s.labaBersih)}
+          </p>
           <p className="cs">
-            Saldo awal {rp(s.saldoAwal)} + laba usaha {rp(s.labaUsaha)} −
-            pengambilan {rp(s.pengambilan)}
+            Margin Bersih: <b>{s.marginBersihPercent}%</b> · HPP: <b>{rp(s.hppPerPcs)}/pcs</b>
           </p>
         </div>
 
-        {/* Tabel rincian */}
-        <div className="card" style={{ marginTop: 12 }}>
-          <table className="report-tbl">
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.label} className={r.kind === "sum" ? "sum" : ""}>
-                  <td>{r.label}</td>
-                  <td
-                    className="num"
-                    style={{
-                      color:
-                        r.value < 0
-                          ? "#e5615a"
-                          : r.kind === "sum"
-                            ? "#0f7db8"
-                            : "#2fa36b",
-                    }}
-                  >
-                    {r.value < 0 ? `−${rp(-r.value)}` : rp(r.value)}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        {/* Highlight Metrics Grid */}
+        <div className="grid" style={{ marginTop: 12 }}>
+          <div className="stat">
+            <p className="t">Omzet</p>
+            <p className="v" style={{ fontSize: 16 }}>{rp(s.omzet)}</p>
+          </div>
+          <div className="stat">
+            <p className="t">Laba Kotor</p>
+            <p className="v" style={{ fontSize: 16, color: "#2fa36b" }}>{rp(s.labaKotor)}</p>
+          </div>
+          <div className="stat">
+            <p className="t">Kas Tersisa</p>
+            <p className="v" style={{ fontSize: 16, color: "#0f7db8" }}>{rp(s.kasTersisa)}</p>
+          </div>
+          <div className="stat">
+            <p className="t">HPP / pcs</p>
+            <p className="v" style={{ fontSize: 16 }}>{rp(s.hppPerPcs)}</p>
+          </div>
         </div>
 
-        {/* Insight */}
+        {/* Tabel Rincian Keuangan */}
+        {reportSections.map((sec, idx) => (
+          <div className="card" style={{ marginTop: 12 }} key={idx}>
+            <p className="ct" style={{ fontSize: 14, marginBottom: 8 }}>{sec.title}</p>
+            <table className="report-tbl">
+              <tbody>
+                {sec.rows.map((r) => (
+                  <tr key={r.label} className={r.kind === "sum" ? "sum" : ""}>
+                    <td>{r.label}</td>
+                    <td
+                      className="num"
+                      style={{
+                        color:
+                          r.value < 0
+                            ? "#e5615a"
+                            : r.kind === "sum"
+                              ? "#0f7db8"
+                              : "#2fa36b",
+                        fontWeight: r.kind === "sum" ? "bold" : "normal",
+                      }}
+                    >
+                      {r.value < 0 ? `−${rp(-r.value)}` : rp(r.value)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        {/* Transisi Versi Lama & Insight */}
         <div className="alert" style={{ marginTop: 12 }}>
-          <div className="ai">💡</div>
+          <div className="ai">📊</div>
           <p>
-            Laba usaha bisa <b>positif</b> tapi kas terasa habis karena{" "}
-            <b>pengambilan</b> ({rp(s.pengambilan)}) menyedot laba. Itu bukan
-            kerugian usaha — hanya uang yang diambil dari kas.
+            <b>Perbandingan Transisi:</b><br />
+            • Laba Bersih Baru: <b>{rp(s.labaBersih)}</b> (memperhitungkan HPP resep & biaya tetap flat)<br />
+            • Laba Usaha Lama: <b>{rp(s.labaUsaha)}</b> (omzet − kas keluar − upah)<br />
+            • Pengambilan Owner: <b>{rp(s.pengambilan)}</b> (SPP ayah / prive)
           </p>
         </div>
 
